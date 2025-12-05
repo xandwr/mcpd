@@ -16,7 +16,7 @@ Claude/Agent → mcpd serve (single MCP server)
                     ↓
          ┌─────────┼─────────┐
          ↓         ↓         ↓
-      archmap   tool-b    tool-c
+       tool-a    tool-b    tool-c
 ```
 
 ## Installation
@@ -49,7 +49,7 @@ Add this to your Claude Desktop or Claude Code MCP configuration:
 mcpd register mytool npx @my/mcp-server
 
 # With environment variables
-mcpd register archmap archmap --mcp -e API_KEY=xxx
+mcpd register mytool mytool --mcp -e API_KEY=xxx
 
 # List registered tools
 mcpd list
@@ -83,9 +83,9 @@ The daemon allows tools to be added/removed without restarting Claude.
 For tool authors, the ideal experience is:
 
 ```bash
-cargo install archmap
-# post-install hook runs: mcpd register archmap
-# tool is now available in Claude
+cargo install mytool
+# post-install hook runs: `mcpd register mytool`
+# mytool is now available in Claude via MCP
 ```
 
 ### Adding post-install hooks
@@ -137,7 +137,7 @@ All configuration lives in `~/.config/mcpd/`:
 
 ## How It Works
 
-1. **Registration**: `mcpd register` adds tool metadata to `~/.config/mcpd/registry.json`, i.e, `uv run mcpd register archmap archmap --mcp-manifest`
+1. **Registration**: `mcpd register` adds tool metadata to `~/.config/mcpd/registry.json`, i.e, `uv run mcpd register mytool mytool --mcp-manifest`
 2. **Serving**: `mcpd serve` runs as an MCP server that Claude connects to
 3. **Proxying**: When Claude requests tools, mcpd spawns the registered tool subprocesses and proxies MCP requests to them
 4. **Aggregation**: Tools from all registered servers are combined (prefixed with `toolname__` to avoid collisions)
