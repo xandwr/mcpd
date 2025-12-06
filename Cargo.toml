@@ -5,6 +5,7 @@ edition = "2024"
 description = "Aggregates multiple MCP servers behind a single endpoint"
 license = "MIT"
 publish = true
+repository = "https://github.com/xandwr/mcpd"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
