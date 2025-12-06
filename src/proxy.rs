@@ -2,17 +2,17 @@
 
 use crate::mcp::{
     self, CallToolParams, CallToolResult, InitializeParams, InitializeResult, ListToolsResult,
-    Notification, Request, RequestId, Response, Tool as McpTool, PROTOCOL_VERSION,
+    Notification, PROTOCOL_VERSION, Request, RequestId, Response, Tool as McpTool,
 };
 use crate::registry::Tool;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
 /// Proxy for communicating with a single MCP tool subprocess
@@ -39,11 +39,6 @@ impl ToolProxy {
             }),
             next_id: AtomicI64::new(1),
         }
-    }
-
-    /// Get the tool name
-    pub fn name(&self) -> &str {
-        &self.tool.name
     }
 
     /// Start the subprocess if not already running
@@ -219,19 +214,13 @@ impl ToolProxy {
     /// Read from stdout until we get the response we're waiting for
     async fn read_until_response(&self, target_id: i64) -> Result<()> {
         loop {
-            let mut state = self.state.lock().await;
-            let process = state
-                .process
-                .as_mut()
-                .ok_or_else(|| anyhow!("Process not started"))?;
-
-            let stdout = process
-                .stdout
-                .as_mut()
-                .ok_or_else(|| anyhow!("No stdout"))?;
-
-            // Release lock while reading (we need to restructure this)
-            drop(state);
+            // Verify process is still running before reading
+            {
+                let state = self.state.lock().await;
+                if state.process.is_none() {
+                    return Err(anyhow!("Process not started"));
+                }
+            }
 
             // This is a bit hacky - we need to read without holding the lock
             // For now, let's use a simpler approach

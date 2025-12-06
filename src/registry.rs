@@ -72,15 +72,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Reload registry from disk
-    pub fn reload(&mut self) -> Result<()> {
-        if self.path.exists() {
-            let content = std::fs::read_to_string(&self.path)?;
-            self.data = serde_json::from_str(&content)?;
-        }
-        Ok(())
-    }
-
     /// Register a new tool
     pub fn register(&mut self, tool: Tool) -> Result<()> {
         self.data.tools.insert(tool.name.clone(), tool);
@@ -94,11 +85,6 @@ impl Registry {
             self.save()?;
         }
         Ok(removed)
-    }
-
-    /// Get a tool by name
-    pub fn get(&self, name: &str) -> Option<&Tool> {
-        self.data.tools.get(name)
     }
 
     /// List all registered tools

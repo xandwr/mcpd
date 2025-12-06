@@ -2,8 +2,8 @@
 
 use crate::mcp::{
     CallToolParams, CallToolResult, Content, InitializeResult, ListToolsResult, Notification,
-    Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool as McpTool, ToolsCapability,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, Request, RequestId, Response, ServerCapabilities, ServerInfo,
+    Tool as McpTool, ToolsCapability,
 };
 use crate::proxy::ToolProxy;
 use crate::registry::Registry;
