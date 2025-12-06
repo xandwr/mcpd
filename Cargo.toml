@@ -1,6 +1,6 @@
 [package]
 name = "mcpd"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Aggregates multiple MCP servers behind a single endpoint"
 license = "MIT"
