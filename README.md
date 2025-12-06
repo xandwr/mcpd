@@ -87,6 +87,8 @@ Point your MCP client at mcpd instead of individual servers.
 }
 ```
 
+**VSCode** (Ctrl+Shift+P, search 'MCP', click 'MCP: Add Server', select 'stdio', type `mcpd serve`)
+
 ## How It Works
 
 1. You register MCP servers with mcpd (stored in `~/.config/mcpd/registry.json`)
