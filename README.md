@@ -7,6 +7,12 @@ Register any MCP server once with mcpd, then point your MCP client at mcpd. Add 
 ## Installation
 
 ```bash
+cargo install mcpd
+```
+
+or for local:
+
+```bash
 cargo install --path .
 ```
 
