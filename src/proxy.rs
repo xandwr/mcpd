@@ -11,25 +11,29 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Proxy for communicating with a single MCP tool subprocess
 pub struct ToolProxy {
     tool: Tool,
     state: Mutex<ProxyState>,
+    /// Serializes initialization attempts so only one caller performs the handshake.
+    /// Separate from `state` because `initialize()` needs to acquire `state` internally.
+    init_lock: Mutex<()>,
     next_id: AtomicI64,
 }
 
 struct ProxyState {
     process: Option<Child>,
     stdin: Option<ChildStdin>,
-    stdout: Option<BufReader<ChildStdout>>,
-    pending: HashMap<i64, oneshot::Sender<Response>>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Response>>>>,
     initialized: bool,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ToolProxy {
@@ -39,10 +43,11 @@ impl ToolProxy {
             state: Mutex::new(ProxyState {
                 process: None,
                 stdin: None,
-                stdout: None,
-                pending: HashMap::new(),
+                pending: Arc::new(Mutex::new(HashMap::new())),
                 initialized: false,
+                reader_task: None,
             }),
+            init_lock: Mutex::new(()),
             next_id: AtomicI64::new(1),
         }
     }
@@ -56,6 +61,11 @@ impl ToolProxy {
             && child.try_wait()?.is_none()
         {
             return Ok(());
+        }
+
+        // Abort old reader task if any
+        if let Some(handle) = state.reader_task.take() {
+            handle.abort();
         }
 
         info!(tool = %self.tool.name, command = ?self.tool.command, "Starting tool subprocess");
@@ -86,9 +96,73 @@ impl ToolProxy {
 
         state.process = Some(child);
         state.stdin = Some(stdin);
-        state.stdout = Some(BufReader::new(stdout));
         state.initialized = false;
-        state.pending.clear();
+
+        // Clear old pending requests
+        {
+            let mut pending = state.pending.lock().await;
+            for (_, tx) in pending.drain() {
+                let _ = tx.send(Response::error(RequestId::Number(0), -1, "Proxy restarted"));
+            }
+        }
+
+        // Spawn background reader task that owns stdout and dispatches responses
+        let pending = Arc::clone(&state.pending);
+        let tool_name = self.tool.name.clone();
+        state.reader_task = Some(tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        debug!(tool = %tool_name, "EOF from subprocess reader");
+                        // Cancel all pending requests on EOF
+                        let mut pending = pending.lock().await;
+                        for (_, tx) in pending.drain() {
+                            let _ = tx.send(Response::error(
+                                RequestId::Number(0),
+                                -1,
+                                "EOF from subprocess",
+                            ));
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        debug!(tool = %tool_name, line = %line.trim(), "Received line");
+
+                        let response: Response = match serde_json::from_str(&line) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(tool = %tool_name, error = %e, line = %line.trim(), "Invalid JSON from subprocess");
+                                continue;
+                            }
+                        };
+
+                        let response_id = match &response.id {
+                            RequestId::Number(n) => *n,
+                            RequestId::String(_) => continue,
+                        };
+
+                        let mut pending = pending.lock().await;
+                        if let Some(tx) = pending.remove(&response_id) {
+                            let _ = tx.send(response);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(tool = %tool_name, error = %e, "Read error from subprocess");
+                        let mut pending = pending.lock().await;
+                        for (_, tx) in pending.drain() {
+                            let _ = tx.send(Response::error(
+                                RequestId::Number(0),
+                                -1,
+                                "Read error from subprocess",
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }));
 
         Ok(())
     }
@@ -98,7 +172,10 @@ impl ToolProxy {
         let mut state = self.state.lock().await;
 
         state.stdin.take();
-        state.stdout.take();
+
+        if let Some(handle) = state.reader_task.take() {
+            handle.abort();
+        }
 
         if let Some(mut child) = state.process.take() {
             info!(tool = %self.tool.name, "Stopping tool subprocess");
@@ -106,8 +183,11 @@ impl ToolProxy {
         }
 
         // Cancel all pending requests
-        for (_, tx) in state.pending.drain() {
-            let _ = tx.send(Response::error(RequestId::Number(0), -1, "Proxy stopped"));
+        {
+            let mut pending = state.pending.lock().await;
+            for (_, tx) in pending.drain() {
+                let _ = tx.send(Response::error(RequestId::Number(0), -1, "Proxy stopped"));
+            }
         }
 
         state.initialized = false;
@@ -142,20 +222,35 @@ impl ToolProxy {
         Ok(result)
     }
 
-    /// Ensure the proxy is started and initialized
+    /// Ensure the proxy is started and initialized.
+    /// Uses a dedicated init_lock to serialize initialization attempts without
+    /// holding the state lock (which initialize() needs internally).
     pub async fn ensure_ready(&self) -> Result<()> {
         self.start().await?;
 
-        let needs_init = {
+        // Fast path: already initialized
+        {
             let state = self.state.lock().await;
-            !state.initialized
-        };
-
-        if needs_init {
-            self.initialize().await?;
-            let mut state = self.state.lock().await;
-            state.initialized = true;
+            if state.initialized {
+                return Ok(());
+            }
         }
+
+        // Slow path: acquire init_lock to serialize concurrent init attempts
+        let _init_guard = self.init_lock.lock().await;
+
+        // Re-check under init_lock — another caller may have finished first
+        {
+            let state = self.state.lock().await;
+            if state.initialized {
+                return Ok(());
+            }
+        }
+
+        self.initialize().await?;
+
+        let mut state = self.state.lock().await;
+        state.initialized = true;
 
         Ok(())
     }
@@ -205,15 +300,12 @@ impl ToolProxy {
 
             // Set up response channel
             let (tx, rx) = oneshot::channel();
-            state.pending.insert(id, tx);
+            state.pending.lock().await.insert(id, tx);
 
             rx
         };
 
-        // Read responses until we get ours
-        // We need to spawn a reader task for this
-        self.read_until_response(id).await?;
-
+        // Wait for the background reader to deliver our response
         let response = rx.await.map_err(|_| anyhow!("Response channel closed"))?;
 
         if let Some(err) = response.error {
@@ -225,41 +317,6 @@ impl ToolProxy {
             .ok_or_else(|| anyhow!("No result in response"))?;
 
         serde_json::from_value(result).context("Failed to parse response")
-    }
-
-    /// Read from stdout until we get the response we're waiting for
-    async fn read_until_response(&self, target_id: i64) -> Result<()> {
-        loop {
-            let mut state = self.state.lock().await;
-            let reader = state
-                .stdout
-                .as_mut()
-                .ok_or_else(|| anyhow!("Process not started"))?;
-
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line).await?;
-
-            if bytes == 0 {
-                return Err(anyhow!("EOF from subprocess"));
-            }
-
-            debug!(tool = %self.tool.name, line = %line.trim(), "Received line");
-
-            let response: Response = serde_json::from_str(&line)
-                .with_context(|| format!("Invalid JSON: {}", line.trim()))?;
-
-            let response_id = match &response.id {
-                RequestId::Number(n) => *n,
-                RequestId::String(_) => continue, // Skip string IDs
-            };
-
-            if let Some(tx) = state.pending.remove(&response_id) {
-                let _ = tx.send(response);
-                if response_id == target_id {
-                    return Ok(());
-                }
-            }
-        }
     }
 
     /// List tools from this server
@@ -322,11 +379,14 @@ impl ToolProxy {
 
 impl Drop for ToolProxy {
     fn drop(&mut self) {
-        // Try to kill the process if it's still running
-        if let Ok(mut state) = self.state.try_lock()
-            && let Some(mut child) = state.process.take()
-        {
-            let _ = child.start_kill();
+        // Abort the reader task
+        if let Ok(mut state) = self.state.try_lock() {
+            if let Some(handle) = state.reader_task.take() {
+                handle.abort();
+            }
+            if let Some(mut child) = state.process.take() {
+                let _ = child.start_kill();
+            }
         }
     }
 }

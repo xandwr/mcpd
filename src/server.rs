@@ -28,6 +28,14 @@ pub struct Server {
     stdout: Arc<Mutex<tokio::io::Stdout>>,
 }
 
+/// Serialize a result to a JSON-RPC success response, returning an internal error response on failure.
+fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> Response {
+    match serde_json::to_value(result) {
+        Ok(value) => Response::success(id, value),
+        Err(e) => Response::error(id, -32603, format!("Serialization failed: {}", e)),
+    }
+}
+
 impl Server {
     pub fn new(registry: Registry) -> Self {
         Self {
@@ -120,7 +128,7 @@ impl Server {
             },
         };
 
-        Response::success(id, serde_json::to_value(result).unwrap())
+        success_or_internal_error(id, &result)
     }
 
     /// Handle tools/list - returns our two static meta-tools
@@ -169,7 +177,7 @@ impl Server {
         info!(count = 2, "Serving static meta-tools");
 
         let result = ListToolsResult { tools };
-        Response::success(id, serde_json::to_value(result).unwrap())
+        success_or_internal_error(id, &result)
     }
 
     /// Aggregate tools from all backend proxies
@@ -244,13 +252,21 @@ impl Server {
         match params.name.as_str() {
             "list_tools" => match self.aggregate_backend_tools().await {
                 Ok(tools) => {
+                    let text = match serde_json::to_string_pretty(&tools) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Response::error(
+                                id,
+                                -32603,
+                                format!("Failed to serialize tools: {}", e),
+                            );
+                        }
+                    };
                     let result = CallToolResult {
-                        content: vec![Content::Text {
-                            text: serde_json::to_string_pretty(&tools).unwrap(),
-                        }],
+                        content: vec![Content::Text { text }],
                         is_error: false,
                     };
-                    Response::success(id, serde_json::to_value(result).unwrap())
+                    success_or_internal_error(id, &result)
                 }
                 Err(e) => {
                     let result = CallToolResult {
@@ -259,7 +275,7 @@ impl Server {
                         }],
                         is_error: true,
                     };
-                    Response::success(id, serde_json::to_value(result).unwrap())
+                    success_or_internal_error(id, &result)
                 }
             },
             "use_tool" => {
@@ -272,7 +288,7 @@ impl Server {
                             }],
                             is_error: true,
                         };
-                        return Response::success(id, serde_json::to_value(result).unwrap());
+                        return success_or_internal_error(id, &result);
                     }
                 };
 
@@ -283,7 +299,7 @@ impl Server {
                     .unwrap_or(json!({}));
 
                 match self.route_tool_call(&tool_name, arguments).await {
-                    Ok(result) => Response::success(id, serde_json::to_value(result).unwrap()),
+                    Ok(result) => success_or_internal_error(id, &result),
                     Err(e) => {
                         error!(tool = %tool_name, error = %e, "use_tool failed");
                         let result = CallToolResult {
@@ -292,7 +308,7 @@ impl Server {
                             }],
                             is_error: true,
                         };
-                        Response::success(id, serde_json::to_value(result).unwrap())
+                        success_or_internal_error(id, &result)
                     }
                 }
             }
@@ -306,9 +322,16 @@ impl Server {
                     }],
                     is_error: true,
                 };
-                Response::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, &result)
             }
         }
+    }
+
+    /// Namespace a backend URI into mcpd:// format, avoiding double-prefixing
+    /// if the backend URI itself starts with mcpd://.
+    fn namespace_uri(proxy_name: &str, uri: &str) -> String {
+        let raw = uri.strip_prefix("mcpd://").unwrap_or(uri);
+        format!("mcpd://{}/{}", proxy_name, raw)
     }
 
     // --- Resources ---
@@ -327,7 +350,7 @@ impl Server {
                 Ok(resources) => {
                     for mut resource in resources {
                         // Namespace the URI: mcpd://server/original-uri
-                        resource.uri = format!("mcpd://{}/{}", proxy_name, resource.uri);
+                        resource.uri = Self::namespace_uri(proxy_name, &resource.uri);
                         resource.name = format!("{}__{}", proxy_name, resource.name);
                         all_resources.push(resource);
                     }
@@ -345,7 +368,7 @@ impl Server {
         let result = ListResourcesResult {
             resources: all_resources,
         };
-        Response::success(id, serde_json::to_value(result).unwrap())
+        success_or_internal_error(id, &result)
     }
 
     /// Route a resources/read call to the appropriate backend
@@ -401,9 +424,9 @@ impl Server {
             Ok(mut result) => {
                 // Re-namespace the URIs in the response
                 for content in &mut result.contents {
-                    content.uri = format!("mcpd://{}/{}", proxy_name, content.uri);
+                    content.uri = Self::namespace_uri(proxy_name, &content.uri);
                 }
-                Response::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, &result)
             }
             Err(e) => Response::error(id, -32603, format!("Failed to read resource: {}", e)),
         }
@@ -441,7 +464,7 @@ impl Server {
         let result = ListPromptsResult {
             prompts: all_prompts,
         };
-        Response::success(id, serde_json::to_value(result).unwrap())
+        success_or_internal_error(id, &result)
     }
 
     /// Route a prompts/get call to the appropriate backend
@@ -481,7 +504,7 @@ impl Server {
         };
 
         match proxy.get_prompt(&original_name, params.arguments).await {
-            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap()),
+            Ok(result) => success_or_internal_error(id, &result),
             Err(e) => Response::error(id, -32603, format!("Failed to get prompt: {}", e)),
         }
     }
@@ -624,5 +647,57 @@ impl Server {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::RequestId;
+
+    #[test]
+    fn namespace_uri_normal() {
+        let result = Server::namespace_uri("myserver", "file:///test.txt");
+        assert_eq!(result, "mcpd://myserver/file:///test.txt");
+    }
+
+    #[test]
+    fn namespace_uri_already_prefixed() {
+        // A backend that returns a URI starting with mcpd:// should not get double-prefixed
+        let result = Server::namespace_uri("myserver", "mcpd://other/resource");
+        assert_eq!(result, "mcpd://myserver/other/resource");
+    }
+
+    #[test]
+    fn namespace_uri_empty() {
+        let result = Server::namespace_uri("srv", "");
+        assert_eq!(result, "mcpd://srv/");
+    }
+
+    #[test]
+    fn success_or_internal_error_with_valid_value() {
+        let id = RequestId::Number(1);
+        let response = success_or_internal_error(id, &"hello");
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn success_or_internal_error_with_unserializable_value() {
+        // A type whose Serialize impl always fails
+        struct AlwaysFail;
+        impl serde::Serialize for AlwaysFail {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("intentional failure"))
+            }
+        }
+
+        let id = RequestId::Number(42);
+        let response = success_or_internal_error(id, &AlwaysFail);
+        assert!(response.error.is_some());
+        assert!(response.result.is_none());
+        let err = response.error.unwrap();
+        assert_eq!(err.code, -32603);
+        assert!(err.message.contains("Serialization failed"));
     }
 }

@@ -3,6 +3,7 @@
 use mcpd::proxy::ToolProxy;
 use mcpd::registry::Tool;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn mock_tool() -> Tool {
     let mock_path = env!("CARGO_BIN_EXE_mock-mcp-server");
@@ -84,5 +85,75 @@ async fn proxy_get_prompt() {
         .unwrap();
     assert_eq!(result.messages.len(), 1);
     assert_eq!(result.messages[0].role, "user");
+    proxy.stop().await.unwrap();
+}
+
+/// Regression test: concurrent requests on the same proxy must not deadlock.
+/// Before the fix, read_until_response held the state mutex across blocking I/O,
+/// so a second concurrent request would block forever waiting for the lock.
+#[tokio::test]
+async fn proxy_concurrent_requests_no_deadlock() {
+    let proxy = Arc::new(ToolProxy::new(mock_tool()));
+
+    // Initialize once so all concurrent calls go straight to call_tool
+    proxy.list_tools().await.unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let proxy = Arc::clone(&proxy);
+        handles.push(tokio::spawn(async move {
+            let result = proxy
+                .call_tool("echo", serde_json::json!({"n": i}))
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+        }));
+    }
+
+    // With the old code this would hang. Use a timeout as a safety net.
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures::future::join_all(handles),
+    )
+    .await
+    .expect("concurrent requests timed out — possible deadlock");
+
+    for r in results {
+        r.unwrap(); // propagate any panics from spawned tasks
+    }
+
+    proxy.stop().await.unwrap();
+}
+
+/// Regression test: concurrent ensure_ready calls must not send duplicate
+/// MCP initialization handshakes. Before the fix, a TOCTOU race on
+/// `state.initialized` allowed multiple callers through.
+#[tokio::test]
+async fn proxy_concurrent_ensure_ready_no_double_init() {
+    let proxy = Arc::new(ToolProxy::new(mock_tool()));
+
+    // Launch several list_tools calls concurrently — each calls ensure_ready internally.
+    // If double-init happened, the mock server would receive two "initialize" requests
+    // and potentially return mismatched responses, causing failures.
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let proxy = Arc::clone(&proxy);
+        handles.push(tokio::spawn(async move {
+            let tools = proxy.list_tools().await.unwrap();
+            assert_eq!(tools.len(), 2);
+        }));
+    }
+
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures::future::join_all(handles),
+    )
+    .await
+    .expect("concurrent ensure_ready timed out — possible deadlock");
+
+    for r in results {
+        r.unwrap();
+    }
+
     proxy.stop().await.unwrap();
 }
