@@ -1,4 +1,4 @@
-//! Aggregating MCP server - combines multiple tool servers into one.
+//! Aggregating MCP server - exposes two meta-tools: list_tools and use_tool.
 
 use crate::mcp::{
     CallToolParams, CallToolResult, Content, InitializeResult, ListToolsResult, Notification,
@@ -8,18 +8,19 @@ use crate::mcp::{
 use crate::proxy::ToolProxy;
 use crate::registry::Registry;
 use anyhow::Result;
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// Aggregating MCP server
+/// Aggregating MCP server that exposes two static tools:
+/// - `list_tools`: discover all available tools from registered backends
+/// - `use_tool`: call any discovered tool by name
 pub struct Server {
     registry: Arc<RwLock<Registry>>,
     proxies: RwLock<HashMap<String, Arc<ToolProxy>>>,
-    /// Maps prefixed tool name -> (proxy_name, original_tool_name)
-    tool_map: RwLock<HashMap<String, (String, String)>>,
     initialized: RwLock<bool>,
 }
 
@@ -28,7 +29,6 @@ impl Server {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             proxies: RwLock::new(HashMap::new()),
-            tool_map: RwLock::new(HashMap::new()),
             initialized: RwLock::new(false),
         }
     }
@@ -68,33 +68,74 @@ impl Server {
         Response::success(id, serde_json::to_value(result).unwrap())
     }
 
-    /// Handle tools/list request
+    /// Handle tools/list - returns our two static meta-tools
     async fn handle_list_tools(&self, id: RequestId) -> Response {
+        let tools = vec![
+            McpTool {
+                name: "list_tools".to_string(),
+                description: Some(
+                    "List all available tools from registered MCP backends. \
+                     Returns tool names, descriptions, and input schemas. \
+                     Call this first to discover what tools are available, \
+                     then use `use_tool` to invoke them."
+                        .to_string(),
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
+            McpTool {
+                name: "use_tool".to_string(),
+                description: Some(
+                    "Invoke a tool by name. Use `list_tools` first to discover \
+                     available tools and their expected arguments."
+                        .to_string(),
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "description": "The fully-qualified tool name (server__tool) as returned by list_tools"
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "Arguments to pass to the tool, matching its input schema"
+                        }
+                    },
+                    "required": ["tool_name"],
+                    "additionalProperties": false
+                }),
+            },
+        ];
+
+        info!(count = 2, "Serving static meta-tools");
+
+        let result = ListToolsResult { tools };
+        Response::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    /// Aggregate tools from all backend proxies
+    async fn aggregate_backend_tools(&self) -> Result<Vec<serde_json::Value>, String> {
         if let Err(e) = self.ensure_proxies().await {
-            return Response::error(id, -1, format!("Failed to ensure proxies: {}", e));
+            return Err(format!("Failed to ensure proxies: {}", e));
         }
 
         let proxies = self.proxies.read().await;
         let mut all_tools = Vec::new();
-        let mut tool_map = self.tool_map.write().await;
-        tool_map.clear();
 
         for (proxy_name, proxy) in proxies.iter() {
             match proxy.list_tools().await {
                 Ok(tools) => {
                     for tool in tools {
-                        // Prefix tool name with proxy name to avoid collisions
                         let prefixed_name = format!("{}__{}", proxy_name, tool.name);
-                        tool_map.insert(
-                            prefixed_name.clone(),
-                            (proxy_name.clone(), tool.name.clone()),
-                        );
-
-                        all_tools.push(McpTool {
-                            name: prefixed_name,
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                        });
+                        all_tools.push(json!({
+                            "name": prefixed_name,
+                            "description": tool.description.unwrap_or_default(),
+                            "input_schema": tool.input_schema,
+                        }));
                     }
                 }
                 Err(e) => {
@@ -103,41 +144,105 @@ impl Server {
             }
         }
 
-        info!(count = all_tools.len(), "Listed tools from all proxies");
-
-        let result = ListToolsResult { tools: all_tools };
-        Response::success(id, serde_json::to_value(result).unwrap())
+        info!(count = all_tools.len(), "Aggregated tools from all backends");
+        Ok(all_tools)
     }
 
-    /// Handle tools/call request
-    async fn handle_call_tool(&self, id: RequestId, params: CallToolParams) -> Response {
-        let (proxy_name, original_name) = {
-            let tool_map = self.tool_map.read().await;
-            match tool_map.get(&params.name) {
-                Some((pn, on)) => (pn.clone(), on.clone()),
-                None => {
-                    return Response::error(id, -1, format!("Unknown tool: {}", params.name));
-                }
-            }
-        };
+    /// Route a use_tool call to the appropriate backend
+    async fn route_tool_call(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CallToolResult, String> {
+        // Parse "proxyname__toolname" format
+        let (proxy_name, original_name) = tool_name
+            .split_once("__")
+            .ok_or_else(|| format!(
+                "Invalid tool name '{}'. Expected format: server__tool. Use list_tools to see available tools.",
+                tool_name
+            ))?;
 
         let proxy = {
-            let proxies = self.proxies.read().await;
-            match proxies.get(&proxy_name) {
-                Some(p) => p.clone(),
-                None => {
-                    return Response::error(id, -1, format!("Proxy not found: {}", proxy_name));
-                }
+            if let Err(e) = self.ensure_proxies().await {
+                return Err(format!("Failed to ensure proxies: {}", e));
             }
+            let proxies = self.proxies.read().await;
+            proxies
+                .get(proxy_name)
+                .cloned()
+                .ok_or_else(|| format!("Unknown server '{}'. Use list_tools to see available tools.", proxy_name))?
         };
 
-        match proxy.call_tool(&original_name, params.arguments).await {
-            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap()),
-            Err(e) => {
-                error!(tool = %params.name, error = %e, "Tool call failed");
+        proxy
+            .call_tool(original_name, arguments)
+            .await
+            .map_err(|e| format!("Tool call failed: {}", e))
+    }
+
+    /// Handle tools/call request - dispatches list_tools and use_tool
+    async fn handle_call_tool(&self, id: RequestId, params: CallToolParams) -> Response {
+        match params.name.as_str() {
+            "list_tools" => match self.aggregate_backend_tools().await {
+                Ok(tools) => {
+                    let result = CallToolResult {
+                        content: vec![Content::Text {
+                            text: serde_json::to_string_pretty(&tools).unwrap(),
+                        }],
+                        is_error: false,
+                    };
+                    Response::success(id, serde_json::to_value(result).unwrap())
+                }
+                Err(e) => {
+                    let result = CallToolResult {
+                        content: vec![Content::Text {
+                            text: format!("Error listing tools: {}", e),
+                        }],
+                        is_error: true,
+                    };
+                    Response::success(id, serde_json::to_value(result).unwrap())
+                }
+            },
+            "use_tool" => {
+                let tool_name = match params.arguments.get("tool_name").and_then(|v| v.as_str()) {
+                    Some(name) => name.to_string(),
+                    None => {
+                        let result = CallToolResult {
+                            content: vec![Content::Text {
+                                text: "Missing required parameter 'tool_name'. Use list_tools to discover available tools.".to_string(),
+                            }],
+                            is_error: true,
+                        };
+                        return Response::success(id, serde_json::to_value(result).unwrap());
+                    }
+                };
+
+                let arguments = params
+                    .arguments
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(json!({}));
+
+                match self.route_tool_call(&tool_name, arguments).await {
+                    Ok(result) => Response::success(id, serde_json::to_value(result).unwrap()),
+                    Err(e) => {
+                        error!(tool = %tool_name, error = %e, "use_tool failed");
+                        let result = CallToolResult {
+                            content: vec![Content::Text {
+                                text: format!("Error: {}", e),
+                            }],
+                            is_error: true,
+                        };
+                        Response::success(id, serde_json::to_value(result).unwrap())
+                    }
+                }
+            }
+            other => {
                 let result = CallToolResult {
                     content: vec![Content::Text {
-                        text: format!("Error: {}", e),
+                        text: format!(
+                            "Unknown tool '{}'. mcpd exposes two tools: list_tools and use_tool.",
+                            other
+                        ),
                     }],
                     is_error: true,
                 };

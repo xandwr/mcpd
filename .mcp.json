@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcpd": {
+      "command": "mcpd",
+      "args": ["serve"]
+    }
+  }
+}
