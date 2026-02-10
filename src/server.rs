@@ -1,9 +1,11 @@
-//! Aggregating MCP server - exposes two meta-tools: list_tools and use_tool.
+//! Aggregating MCP server - exposes two meta-tools (list_tools, use_tool) and
+//! natively proxies resources and prompts from all registered backends.
 
 use crate::mcp::{
-    CallToolParams, CallToolResult, Content, InitializeResult, ListToolsResult, Notification,
-    PROTOCOL_VERSION, Request, RequestId, Response, ServerCapabilities, ServerInfo,
-    Tool as McpTool, ToolsCapability,
+    CallToolParams, CallToolResult, Content, GetPromptParams, InitializeResult, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, Notification, PROTOCOL_VERSION, PromptsCapability,
+    ReadResourceParams, Request, RequestId, ResourcesCapability, Response, ServerCapabilities,
+    ServerInfo, Tool as McpTool, ToolsCapability,
 };
 use crate::proxy::ToolProxy;
 use crate::registry::Registry;
@@ -56,6 +58,12 @@ impl Server {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
+                    list_changed: false,
+                }),
+                resources: Some(ResourcesCapability {
+                    list_changed: false,
+                }),
+                prompts: Some(PromptsCapability {
                     list_changed: false,
                 }),
             },
@@ -144,7 +152,10 @@ impl Server {
             }
         }
 
-        info!(count = all_tools.len(), "Aggregated tools from all backends");
+        info!(
+            count = all_tools.len(),
+            "Aggregated tools from all backends"
+        );
         Ok(all_tools)
     }
 
@@ -167,10 +178,12 @@ impl Server {
                 return Err(format!("Failed to ensure proxies: {}", e));
             }
             let proxies = self.proxies.read().await;
-            proxies
-                .get(proxy_name)
-                .cloned()
-                .ok_or_else(|| format!("Unknown server '{}'. Use list_tools to see available tools.", proxy_name))?
+            proxies.get(proxy_name).cloned().ok_or_else(|| {
+                format!(
+                    "Unknown server '{}'. Use list_tools to see available tools.",
+                    proxy_name
+                )
+            })?
         };
 
         proxy
@@ -251,6 +264,181 @@ impl Server {
         }
     }
 
+    // --- Resources ---
+
+    /// Aggregate resources from all backends, namespacing URIs
+    async fn handle_list_resources(&self, id: RequestId) -> Response {
+        if let Err(e) = self.ensure_proxies().await {
+            return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
+        }
+
+        let proxies = self.proxies.read().await;
+        let mut all_resources = Vec::new();
+
+        for (proxy_name, proxy) in proxies.iter() {
+            match proxy.list_resources().await {
+                Ok(resources) => {
+                    for mut resource in resources {
+                        // Namespace the URI: mcpd://server/original-uri
+                        resource.uri = format!("mcpd://{}/{}", proxy_name, resource.uri);
+                        resource.name = format!("{}__{}", proxy_name, resource.name);
+                        all_resources.push(resource);
+                    }
+                }
+                Err(e) => {
+                    debug!(proxy = %proxy_name, error = %e, "Backend doesn't support resources (skipping)");
+                }
+            }
+        }
+
+        info!(
+            count = all_resources.len(),
+            "Aggregated resources from all backends"
+        );
+        let result = ListResourcesResult {
+            resources: all_resources,
+        };
+        Response::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    /// Route a resources/read call to the appropriate backend
+    async fn handle_read_resource(&self, id: RequestId, params: ReadResourceParams) -> Response {
+        // Parse "mcpd://server/original-uri"
+        let uri = &params.uri;
+        let stripped = match uri.strip_prefix("mcpd://") {
+            Some(s) => s,
+            None => {
+                return Response::error(
+                    id,
+                    -32602,
+                    format!(
+                        "Invalid resource URI '{}'. Expected mcpd://server/uri format.",
+                        uri
+                    ),
+                );
+            }
+        };
+
+        let (proxy_name, original_uri) = match stripped.split_once('/') {
+            Some((name, rest)) => (name, rest),
+            None => {
+                return Response::error(
+                    id,
+                    -32602,
+                    format!(
+                        "Invalid resource URI '{}'. Expected mcpd://server/uri format.",
+                        uri
+                    ),
+                );
+            }
+        };
+
+        let proxy = {
+            if let Err(e) = self.ensure_proxies().await {
+                return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
+            }
+            let proxies = self.proxies.read().await;
+            match proxies.get(proxy_name).cloned() {
+                Some(p) => p,
+                None => {
+                    return Response::error(
+                        id,
+                        -32602,
+                        format!("Unknown server '{}' in resource URI.", proxy_name),
+                    );
+                }
+            }
+        };
+
+        match proxy.read_resource(original_uri).await {
+            Ok(mut result) => {
+                // Re-namespace the URIs in the response
+                for content in &mut result.contents {
+                    content.uri = format!("mcpd://{}/{}", proxy_name, content.uri);
+                }
+                Response::success(id, serde_json::to_value(result).unwrap())
+            }
+            Err(e) => Response::error(id, -32603, format!("Failed to read resource: {}", e)),
+        }
+    }
+
+    // --- Prompts ---
+
+    /// Aggregate prompts from all backends, namespacing names
+    async fn handle_list_prompts(&self, id: RequestId) -> Response {
+        if let Err(e) = self.ensure_proxies().await {
+            return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
+        }
+
+        let proxies = self.proxies.read().await;
+        let mut all_prompts = Vec::new();
+
+        for (proxy_name, proxy) in proxies.iter() {
+            match proxy.list_prompts().await {
+                Ok(prompts) => {
+                    for mut prompt in prompts {
+                        prompt.name = format!("{}__{}", proxy_name, prompt.name);
+                        all_prompts.push(prompt);
+                    }
+                }
+                Err(e) => {
+                    debug!(proxy = %proxy_name, error = %e, "Backend doesn't support prompts (skipping)");
+                }
+            }
+        }
+
+        info!(
+            count = all_prompts.len(),
+            "Aggregated prompts from all backends"
+        );
+        let result = ListPromptsResult {
+            prompts: all_prompts,
+        };
+        Response::success(id, serde_json::to_value(result).unwrap())
+    }
+
+    /// Route a prompts/get call to the appropriate backend
+    async fn handle_get_prompt(&self, id: RequestId, params: GetPromptParams) -> Response {
+        let (proxy_name, original_name) = match params.name.split_once("__") {
+            Some((server, name)) => (server.to_string(), name.to_string()),
+            None => {
+                return Response::error(
+                    id,
+                    -32602,
+                    format!(
+                        "Invalid prompt name '{}'. Expected format: server__prompt.",
+                        params.name
+                    ),
+                );
+            }
+        };
+
+        let proxy = {
+            if let Err(e) = self.ensure_proxies().await {
+                return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
+            }
+            let proxies = self.proxies.read().await;
+            match proxies.get(&proxy_name).cloned() {
+                Some(p) => p,
+                None => {
+                    return Response::error(
+                        id,
+                        -32602,
+                        format!(
+                            "Unknown server '{}'. Use prompts/list to see available prompts.",
+                            proxy_name
+                        ),
+                    );
+                }
+            }
+        };
+
+        match proxy.get_prompt(&original_name, params.arguments).await {
+            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap()),
+            Err(e) => Response::error(id, -32603, format!("Failed to get prompt: {}", e)),
+        }
+    }
+
     /// Handle a single request
     async fn handle_request(&self, request: Request) -> Response {
         debug!(method = %request.method, id = ?request.id, "Handling request");
@@ -275,6 +463,44 @@ impl Server {
                     }
                 };
                 self.handle_call_tool(request.id, params).await
+            }
+            "resources/list" => self.handle_list_resources(request.id).await,
+            "resources/read" => {
+                let params: ReadResourceParams = match request.params {
+                    Some(p) => match serde_json::from_value(p) {
+                        Ok(params) => params,
+                        Err(e) => {
+                            return Response::error(
+                                request.id,
+                                -32602,
+                                format!("Invalid params: {}", e),
+                            );
+                        }
+                    },
+                    None => {
+                        return Response::error(request.id, -32602, "Missing params");
+                    }
+                };
+                self.handle_read_resource(request.id, params).await
+            }
+            "prompts/list" => self.handle_list_prompts(request.id).await,
+            "prompts/get" => {
+                let params: GetPromptParams = match request.params {
+                    Some(p) => match serde_json::from_value(p) {
+                        Ok(params) => params,
+                        Err(e) => {
+                            return Response::error(
+                                request.id,
+                                -32602,
+                                format!("Invalid params: {}", e),
+                            );
+                        }
+                    },
+                    None => {
+                        return Response::error(request.id, -32602, "Missing params");
+                    }
+                };
+                self.handle_get_prompt(request.id, params).await
             }
             _ => Response::error(
                 request.id,

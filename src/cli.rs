@@ -109,7 +109,10 @@ impl Cli {
 
             Commands::Serve => {
                 let registry = Registry::load()?;
-                info!(backends = registry.len(), "Starting MCP server (2 meta-tools: list_tools, use_tool)");
+                info!(
+                    backends = registry.len(),
+                    "Starting MCP server (2 meta-tools: list_tools, use_tool)"
+                );
 
                 let server = Server::new(registry);
                 server.run().await

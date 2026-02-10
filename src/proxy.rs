@@ -1,8 +1,10 @@
 //! Tool proxy - manages subprocess communication with MCP tool servers.
 
 use crate::mcp::{
-    self, CallToolParams, CallToolResult, InitializeParams, InitializeResult, ListToolsResult,
-    Notification, PROTOCOL_VERSION, Request, RequestId, Response, Tool as McpTool,
+    self, CallToolParams, CallToolResult, GetPromptParams, GetPromptResult, InitializeParams,
+    InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult, Notification,
+    PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Request, RequestId, Resource,
+    Response, Tool as McpTool,
 };
 use crate::registry::Tool;
 use anyhow::{Context, Result, anyhow};
@@ -73,8 +75,14 @@ impl ToolProxy {
 
         info!(tool = %self.tool.name, pid = ?child.id(), "Tool subprocess started");
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to capture stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stdout"))?;
 
         state.process = Some(child);
         state.stdin = Some(stdin);
@@ -269,6 +277,45 @@ impl ToolProxy {
             arguments,
         };
         self.call("tools/call", Some(serde_json::to_value(params)?))
+            .await
+    }
+
+    /// List resources from this server
+    pub async fn list_resources(&self) -> Result<Vec<Resource>> {
+        self.ensure_ready().await?;
+        let result: ListResourcesResult = self.call("resources/list", None).await?;
+        Ok(result.resources)
+    }
+
+    /// Read a resource
+    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
+        self.ensure_ready().await?;
+        let params = ReadResourceParams {
+            uri: uri.to_string(),
+        };
+        self.call("resources/read", Some(serde_json::to_value(params)?))
+            .await
+    }
+
+    /// List prompts from this server
+    pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
+        self.ensure_ready().await?;
+        let result: ListPromptsResult = self.call("prompts/list", None).await?;
+        Ok(result.prompts)
+    }
+
+    /// Get a prompt
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> Result<GetPromptResult> {
+        self.ensure_ready().await?;
+        let params = GetPromptParams {
+            name: name.to_string(),
+            arguments,
+        };
+        self.call("prompts/get", Some(serde_json::to_value(params)?))
             .await
     }
 }

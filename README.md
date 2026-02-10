@@ -1,8 +1,8 @@
 # mcpd
 
-A daemon that aggregates multiple MCP (Model Context Protocol) servers into one.
+A daemon that aggregates multiple MCP (Model Context Protocol) servers into one. Implements the [MCP spec](https://spec.modelcontextprotocol.io/) (2025-11-25).
 
-Register any MCP server once with mcpd, then point your MCP client at mcpd. Add or remove servers at any time — agents discover new tools in realtime.
+Register any MCP server once with mcpd, then point your MCP client at mcpd. Add or remove servers at any time — agents discover new tools, resources, and prompts in realtime.
 
 ## Installation
 
@@ -91,19 +91,40 @@ Point your MCP client at mcpd instead of individual servers.
 
 ## How It Works
 
-mcpd exposes exactly **two tools** to the MCP client, regardless of how many backend servers are registered:
+mcpd aggregates all three MCP primitives — **tools**, **resources**, and **prompts** — from every registered backend into a single server.
+
+### Tools (dual-layer)
+
+mcpd exposes exactly **two meta-tools** to the MCP client, regardless of how many backend servers are registered:
 
 - **`list_tools`** — Queries all registered backends and returns their tools (names, descriptions, input schemas).
 - **`use_tool`** — Invokes a backend tool by its fully-qualified name (`server__tool`) with the given arguments.
 
 The agent naturally calls `list_tools` first (it's the only way to know what's available), then calls `use_tool` to invoke what it needs. You can register or unregister backends at any time — the agent just calls `list_tools` again to see the latest.
 
+### Resources
+
+mcpd natively proxies `resources/list` and `resources/read`. Resources from all backends are aggregated and namespaced:
+
+- URIs are prefixed: `mcpd://servername/original-uri`
+- Names are prefixed: `servername__resourcename`
+
+Backends that don't support resources are silently skipped.
+
+### Prompts
+
+mcpd natively proxies `prompts/list` and `prompts/get`. Prompts from all backends are aggregated and namespaced:
+
+- Names are prefixed: `servername__promptname`
+
+Backends that don't support prompts are silently skipped.
+
 ```
 ┌─────────────────┐
 │   MCP Client    │
 │ (Claude, etc.)  │
 └────────┬────────┘
-         │ sees: list_tools, use_tool
+         │ tools, resources, prompts
          ▼
 ┌─────────────────┐
 │      mcpd       │
@@ -118,10 +139,11 @@ The agent naturally calls `list_tools` first (it's the only way to know what's a
 ### Workflow
 
 1. You register MCP servers with mcpd (stored in `~/.config/mcpd/registry.json`)
-2. Your MCP client connects to mcpd and sees two tools: `list_tools` and `use_tool`
+2. Your MCP client connects to mcpd and sees two meta-tools (`list_tools`, `use_tool`) plus aggregated resources and prompts
 3. Agent calls `list_tools` to discover available backend tools
 4. Agent calls `use_tool(tool_name="server__tool", arguments={...})` to invoke them
-5. mcpd spawns backend servers on-demand and proxies the call
+5. Client can also call `resources/list`, `resources/read`, `prompts/list`, `prompts/get` directly
+6. mcpd spawns backend servers on-demand and proxies the call
 
 ### Example
 
@@ -137,13 +159,33 @@ Agent calls: use_tool(tool_name="filesystem__read_file", arguments={"path": "/tm
 Returns: contents of the file
 ```
 
+Resources and prompts work via standard MCP methods:
+
+```
+Client calls: resources/list
+Returns:
+  [{"uri": "mcpd://myserver/file:///docs/readme.md", "name": "myserver__readme", ...}]
+
+Client calls: resources/read(uri="mcpd://myserver/file:///docs/readme.md")
+Returns: resource contents
+
+Client calls: prompts/list
+Returns:
+  [{"name": "myserver__summarize", "description": "Summarize a document", ...}]
+
+Client calls: prompts/get(name="myserver__summarize", arguments={"text": "..."})
+Returns: prompt messages
+```
+
 ## Why mcpd?
 
 - **Register once**: Add servers to mcpd, not to every client
-- **Realtime discovery**: Register/unregister servers without restarting clients — agents see changes on the next `list_tools` call
-- **Stable interface**: Clients always see exactly two tools, no matter how many backends exist
-- **Namespace isolation**: Tools from different servers can't collide (`server__tool` format)
-- **On-demand**: Backend servers only spawn when their tools are actually invoked
+- **Full MCP proxy**: Aggregates tools, resources, and prompts from all backends
+- **Realtime discovery**: Register/unregister servers without restarting clients — agents see changes on the next list call
+- **Stable interface**: Clients always see exactly two meta-tools, no matter how many backends exist
+- **Namespace isolation**: Tools, resources, and prompts from different servers can't collide (`server__name` format)
+- **On-demand**: Backend servers only spawn when actually needed
+- **Graceful degradation**: Backends that don't support resources or prompts are silently skipped
 
 ## License
 
