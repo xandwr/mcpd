@@ -451,4 +451,29 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
     }
+
+    #[test]
+    fn prompt_skips_empty_arguments() {
+        let prompt = Prompt {
+            name: "greet".to_string(),
+            description: Some("A greeting".to_string()),
+            arguments: vec![],
+        };
+        let json_val = serde_json::to_value(&prompt).unwrap();
+        assert!(json_val.get("arguments").is_none());
+
+        let with_args = Prompt {
+            name: "greet".to_string(),
+            description: None,
+            arguments: vec![PromptArgument {
+                name: "name".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+        let json_val = serde_json::to_value(&with_args).unwrap();
+        assert!(json_val.get("arguments").is_some());
+        assert_eq!(json_val["arguments"][0]["name"], "name");
+        assert_eq!(json_val["arguments"][0]["required"], true);
+    }
 }
