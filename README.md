@@ -181,7 +181,7 @@ Returns: prompt messages
 
 - **Register once**: Add servers to mcpd, not to every client
 - **Full MCP proxy**: Aggregates tools, resources, and prompts from all backends
-- **Realtime discovery**: Register/unregister servers without restarting clients — agents see changes on the next list call
+- **Hot reload**: Register/unregister servers while mcpd is running — the registry is re-read on every request, and clients are notified via `list_changed` notifications
 - **Stable interface**: Clients always see exactly two meta-tools, no matter how many backends exist
 - **Namespace isolation**: Tools, resources, and prompts from different servers can't collide (`server__name` format)
 - **On-demand**: Backend servers only spawn when actually needed
