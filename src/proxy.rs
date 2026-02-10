@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info};
 
@@ -24,6 +24,8 @@ pub struct ToolProxy {
 
 struct ProxyState {
     process: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<BufReader<ChildStdout>>,
     pending: HashMap<i64, oneshot::Sender<Response>>,
     initialized: bool,
 }
@@ -34,6 +36,8 @@ impl ToolProxy {
             tool,
             state: Mutex::new(ProxyState {
                 process: None,
+                stdin: None,
+                stdout: None,
                 pending: HashMap::new(),
                 initialized: false,
             }),
@@ -63,13 +67,18 @@ impl ToolProxy {
             .stderr(Stdio::piped())
             .envs(&self.tool.env);
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn tool: {}", self.tool.name))?;
 
         info!(tool = %self.tool.name, pid = ?child.id(), "Tool subprocess started");
 
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to capture stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
+
         state.process = Some(child);
+        state.stdin = Some(stdin);
+        state.stdout = Some(BufReader::new(stdout));
         state.initialized = false;
         state.pending.clear();
 
@@ -79,6 +88,9 @@ impl ToolProxy {
     /// Stop the subprocess
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().await;
+
+        state.stdin.take();
+        state.stdout.take();
 
         if let Some(mut child) = state.process.take() {
             info!(tool = %self.tool.name, "Stopping tool subprocess");
@@ -143,12 +155,10 @@ impl ToolProxy {
     /// Send a notification (no response expected)
     async fn notify(&self, method: &str) -> Result<()> {
         let mut state = self.state.lock().await;
-        let process = state
-            .process
+        let stdin = state
+            .stdin
             .as_mut()
             .ok_or_else(|| anyhow!("Process not started"))?;
-
-        let stdin = process.stdin.as_mut().ok_or_else(|| anyhow!("No stdin"))?;
 
         let notification = Notification::new(method);
         let mut line = serde_json::to_string(&notification)?;
@@ -172,12 +182,10 @@ impl ToolProxy {
 
         let rx = {
             let mut state = self.state.lock().await;
-            let process = state
-                .process
+            let stdin = state
+                .stdin
                 .as_mut()
                 .ok_or_else(|| anyhow!("Process not started"))?;
-
-            let stdin = process.stdin.as_mut().ok_or_else(|| anyhow!("No stdin"))?;
 
             let mut line = serde_json::to_string(&request)?;
             line.push('\n');
@@ -214,19 +222,16 @@ impl ToolProxy {
     /// Read from stdout until we get the response we're waiting for
     async fn read_until_response(&self, target_id: i64) -> Result<()> {
         loop {
-            // Verify process is still running before reading
-            {
-                let state = self.state.lock().await;
-                if state.process.is_none() {
-                    return Err(anyhow!("Process not started"));
-                }
-            }
+            let mut state = self.state.lock().await;
+            let reader = state
+                .stdout
+                .as_mut()
+                .ok_or_else(|| anyhow!("Process not started"))?;
 
-            // This is a bit hacky - we need to read without holding the lock
-            // For now, let's use a simpler approach
-            let line = self.read_line().await?;
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).await?;
 
-            if line.is_empty() {
+            if bytes == 0 {
                 return Err(anyhow!("EOF from subprocess"));
             }
 
@@ -240,7 +245,6 @@ impl ToolProxy {
                 RequestId::String(_) => continue, // Skip string IDs
             };
 
-            let mut state = self.state.lock().await;
             if let Some(tx) = state.pending.remove(&response_id) {
                 let _ = tx.send(response);
                 if response_id == target_id {
@@ -248,26 +252,6 @@ impl ToolProxy {
                 }
             }
         }
-    }
-
-    /// Read a single line from stdout
-    async fn read_line(&self) -> Result<String> {
-        let mut state = self.state.lock().await;
-        let process = state
-            .process
-            .as_mut()
-            .ok_or_else(|| anyhow!("Process not started"))?;
-
-        let stdout = process
-            .stdout
-            .as_mut()
-            .ok_or_else(|| anyhow!("No stdout"))?;
-
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-
-        Ok(line)
     }
 
     /// List tools from this server
