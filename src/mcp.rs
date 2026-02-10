@@ -191,4 +191,4 @@ pub enum Content {
 }
 
 /// Protocol version we support
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
