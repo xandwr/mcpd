@@ -1,11 +1,12 @@
 [package]
 name = "mcpd"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 description = "Aggregates multiple MCP servers behind a single endpoint"
 license = "MIT"
 publish = true
 repository = "https://github.com/xandwr/mcpd"
+homepage = "https://www.xandwr.com/projects"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
