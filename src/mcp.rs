@@ -443,4 +443,12 @@ mod tests {
         assert!(json_val.get("description").is_none());
         assert!(json_val.get("mimeType").is_none());
     }
+
+    #[test]
+    fn call_tool_result_is_error_defaults_false() {
+        let json_str = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let result: CallToolResult = serde_json::from_str(json_str).unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+    }
 }
