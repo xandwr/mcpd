@@ -6,7 +6,7 @@ description = "Aggregates multiple MCP servers behind a single endpoint"
 license = "MIT"
 publish = true
 repository = "https://github.com/xandwr/mcpd"
-homepage = "https://www.xandwr.com/projects"
+homepage = "https://www.xandwr.com/projects/mcpd"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
