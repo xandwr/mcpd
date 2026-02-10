@@ -14,7 +14,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Aggregating MCP server that exposes two static tools:
@@ -24,6 +24,8 @@ pub struct Server {
     registry: Arc<RwLock<Registry>>,
     proxies: RwLock<HashMap<String, Arc<ToolProxy>>>,
     initialized: RwLock<bool>,
+    /// Shared stdout handle for sending notifications outside request handling
+    stdout: Arc<Mutex<tokio::io::Stdout>>,
 }
 
 impl Server {
@@ -32,21 +34,72 @@ impl Server {
             registry: Arc::new(RwLock::new(registry)),
             proxies: RwLock::new(HashMap::new()),
             initialized: RwLock::new(false),
+            stdout: Arc::new(Mutex::new(tokio::io::stdout())),
         }
     }
 
-    /// Ensure all registered tools have proxies
-    async fn ensure_proxies(&self) -> Result<()> {
-        let registry = self.registry.read().await;
-        let mut proxies = self.proxies.write().await;
+    /// Reload registry from disk, sync proxies, and notify client if anything changed.
+    async fn sync_registry(&self) -> Result<()> {
+        let mut registry = self.registry.write().await;
+        registry.reload()?;
+        let new_names = registry.names();
 
+        let mut proxies = self.proxies.write().await;
+        let mut changed = false;
+
+        // Add proxies for newly registered servers
         for tool in registry.list() {
             if !proxies.contains_key(&tool.name) {
-                info!(tool = %tool.name, "Creating proxy");
+                info!(tool = %tool.name, "Creating proxy for new backend");
                 proxies.insert(tool.name.clone(), Arc::new(ToolProxy::new(tool.clone())));
+                changed = true;
             }
         }
 
+        // Remove proxies for unregistered servers
+        let stale: Vec<String> = proxies
+            .keys()
+            .filter(|name| !new_names.contains(*name))
+            .cloned()
+            .collect();
+
+        for name in stale {
+            if let Some(proxy) = proxies.remove(&name) {
+                info!(tool = %name, "Removing proxy for unregistered backend");
+                let _ = proxy.stop().await;
+            }
+            changed = true;
+        }
+
+        // Drop locks before sending notifications
+        drop(proxies);
+        drop(registry);
+
+        if changed {
+            let initialized = *self.initialized.read().await;
+            if initialized {
+                info!("Registry changed, notifying client");
+                self.send_notification("notifications/tools/list_changed")
+                    .await?;
+                self.send_notification("notifications/resources/list_changed")
+                    .await?;
+                self.send_notification("notifications/prompts/list_changed")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send a JSON-RPC notification to the client via stdout
+    async fn send_notification(&self, method: &str) -> Result<()> {
+        let notification = Notification::new(method);
+        let mut line = serde_json::to_string(&notification)?;
+        line.push('\n');
+        let mut stdout = self.stdout.lock().await;
+        stdout.write_all(line.as_bytes()).await?;
+        stdout.flush().await?;
+        debug!(method, "Sent notification to client");
         Ok(())
     }
 
@@ -58,13 +111,13 @@ impl Server {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
-                    list_changed: false,
+                    list_changed: true,
                 }),
                 resources: Some(ResourcesCapability {
-                    list_changed: false,
+                    list_changed: true,
                 }),
                 prompts: Some(PromptsCapability {
-                    list_changed: false,
+                    list_changed: true,
                 }),
             },
             server_info: ServerInfo {
@@ -127,7 +180,7 @@ impl Server {
 
     /// Aggregate tools from all backend proxies
     async fn aggregate_backend_tools(&self) -> Result<Vec<serde_json::Value>, String> {
-        if let Err(e) = self.ensure_proxies().await {
+        if let Err(e) = self.sync_registry().await {
             return Err(format!("Failed to ensure proxies: {}", e));
         }
 
@@ -174,7 +227,7 @@ impl Server {
             ))?;
 
         let proxy = {
-            if let Err(e) = self.ensure_proxies().await {
+            if let Err(e) = self.sync_registry().await {
                 return Err(format!("Failed to ensure proxies: {}", e));
             }
             let proxies = self.proxies.read().await;
@@ -268,7 +321,7 @@ impl Server {
 
     /// Aggregate resources from all backends, namespacing URIs
     async fn handle_list_resources(&self, id: RequestId) -> Response {
-        if let Err(e) = self.ensure_proxies().await {
+        if let Err(e) = self.sync_registry().await {
             return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
         }
 
@@ -334,7 +387,7 @@ impl Server {
         };
 
         let proxy = {
-            if let Err(e) = self.ensure_proxies().await {
+            if let Err(e) = self.sync_registry().await {
                 return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
             }
             let proxies = self.proxies.read().await;
@@ -366,7 +419,7 @@ impl Server {
 
     /// Aggregate prompts from all backends, namespacing names
     async fn handle_list_prompts(&self, id: RequestId) -> Response {
-        if let Err(e) = self.ensure_proxies().await {
+        if let Err(e) = self.sync_registry().await {
             return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
         }
 
@@ -414,7 +467,7 @@ impl Server {
         };
 
         let proxy = {
-            if let Err(e) = self.ensure_proxies().await {
+            if let Err(e) = self.sync_registry().await {
                 return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
             }
             let proxies = self.proxies.read().await;
@@ -530,7 +583,6 @@ impl Server {
     /// Run the server on stdio
     pub async fn run(&self) -> Result<()> {
         let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
 
         info!("MCP server starting on stdio");
@@ -556,6 +608,7 @@ impl Server {
                 let response = self.handle_request(request).await;
                 let mut response_line = serde_json::to_string(&response)?;
                 response_line.push('\n');
+                let mut stdout = self.stdout.lock().await;
                 stdout.write_all(response_line.as_bytes()).await?;
                 stdout.flush().await?;
                 continue;

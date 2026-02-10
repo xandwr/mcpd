@@ -101,4 +101,23 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.data.tools.is_empty()
     }
+
+    /// Reload registry from disk. Returns the set of current tool names.
+    pub fn reload(&mut self) -> Result<()> {
+        let data = if self.path.exists() {
+            let content = std::fs::read_to_string(&self.path)
+                .with_context(|| format!("Failed to read registry from {}", self.path.display()))?;
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse registry from {}", self.path.display()))?
+        } else {
+            RegistryData::default()
+        };
+        self.data = data;
+        Ok(())
+    }
+
+    /// Get the set of registered tool names
+    pub fn names(&self) -> std::collections::HashSet<String> {
+        self.data.tools.keys().cloned().collect()
+    }
 }
