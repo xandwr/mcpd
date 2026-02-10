@@ -304,3 +304,143 @@ pub enum Content {
 
 /// Protocol version we support
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_new_with_number_id() {
+        let req = Request::new(1_i64, "tools/list", None);
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.id, RequestId::Number(1));
+        assert_eq!(req.method, "tools/list");
+        assert!(req.params.is_none());
+    }
+
+    #[test]
+    fn request_new_with_string_id() {
+        let req = Request::new("abc".to_string(), "initialize", Some(json!({"key": "val"})));
+        assert_eq!(req.id, RequestId::String("abc".to_string()));
+        assert!(req.params.is_some());
+    }
+
+    #[test]
+    fn request_json_roundtrip() {
+        let req = Request::new(42_i64, "tools/call", Some(json!({"name": "test"})));
+        let json_str = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.method, "tools/call");
+        assert_eq!(parsed.id, RequestId::Number(42));
+    }
+
+    #[test]
+    fn response_success_roundtrip() {
+        let resp = Response::success(RequestId::Number(1), json!({"tools": []}));
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let parsed: Response = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.result.is_some());
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn response_error_roundtrip() {
+        let resp = Response::error(RequestId::Number(1), -32601, "Method not found");
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let parsed: Response = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.result.is_none());
+        let err = parsed.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "Method not found");
+    }
+
+    #[test]
+    fn notification_new() {
+        let n = Notification::new("notifications/initialized");
+        assert_eq!(n.jsonrpc, "2.0");
+        assert_eq!(n.method, "notifications/initialized");
+        assert!(n.params.is_none());
+    }
+
+    #[test]
+    fn request_id_number_serde() {
+        let id = RequestId::Number(42);
+        let json_str = serde_json::to_string(&id).unwrap();
+        assert_eq!(json_str, "42");
+        let parsed: RequestId = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn request_id_string_serde() {
+        let id = RequestId::String("req-001".to_string());
+        let json_str = serde_json::to_string(&id).unwrap();
+        assert_eq!(json_str, "\"req-001\"");
+        let parsed: RequestId = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn initialize_result_camel_case() {
+        let result = InitializeResult {
+            protocol_version: "2025-11-25".to_string(),
+            capabilities: ServerCapabilities::default(),
+            server_info: ServerInfo {
+                name: "test".to_string(),
+                version: "0.1.0".to_string(),
+            },
+        };
+        let json_val = serde_json::to_value(&result).unwrap();
+        assert!(json_val.get("protocolVersion").is_some());
+        assert!(json_val.get("serverInfo").is_some());
+    }
+
+    #[test]
+    fn call_tool_params_roundtrip() {
+        let json_str = r#"{"name":"my_tool","arguments":{"path":"/tmp"}}"#;
+        let params: CallToolParams = serde_json::from_str(json_str).unwrap();
+        assert_eq!(params.name, "my_tool");
+        assert_eq!(params.arguments["path"], "/tmp");
+    }
+
+    #[test]
+    fn content_tagged_enum() {
+        let text = Content::Text {
+            text: "hello".to_string(),
+        };
+        let json_val = serde_json::to_value(&text).unwrap();
+        assert_eq!(json_val["type"], "text");
+        assert_eq!(json_val["text"], "hello");
+    }
+
+    #[test]
+    fn prompt_content_tagged_enum() {
+        let text = PromptContent::Text {
+            text: "hello".to_string(),
+        };
+        let json_val = serde_json::to_value(&text).unwrap();
+        assert_eq!(json_val["type"], "text");
+        assert_eq!(json_val["text"], "hello");
+    }
+
+    #[test]
+    fn server_capabilities_default_skips_none() {
+        let caps = ServerCapabilities::default();
+        let json_val = serde_json::to_value(&caps).unwrap();
+        assert_eq!(json_val, json!({}));
+    }
+
+    #[test]
+    fn resource_optional_fields_skip() {
+        let r = Resource {
+            uri: "file:///test".to_string(),
+            name: "test".to_string(),
+            description: None,
+            mime_type: None,
+        };
+        let json_val = serde_json::to_value(&r).unwrap();
+        assert!(json_val.get("description").is_none());
+        assert!(json_val.get("mimeType").is_none());
+    }
+}

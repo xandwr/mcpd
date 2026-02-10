@@ -52,10 +52,10 @@ impl ToolProxy {
         let mut state = self.state.lock().await;
 
         // Check if already running
-        if let Some(ref mut child) = state.process {
-            if child.try_wait()?.is_none() {
-                return Ok(());
-            }
+        if let Some(ref mut child) = state.process
+            && child.try_wait()?.is_none()
+        {
+            return Ok(());
         }
 
         info!(tool = %self.tool.name, command = ?self.tool.command, "Starting tool subprocess");
@@ -323,10 +323,10 @@ impl ToolProxy {
 impl Drop for ToolProxy {
     fn drop(&mut self) {
         // Try to kill the process if it's still running
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(mut child) = state.process.take() {
-                let _ = child.start_kill();
-            }
+        if let Ok(mut state) = self.state.try_lock()
+            && let Some(mut child) = state.process.take()
+        {
+            let _ = child.start_kill();
         }
     }
 }

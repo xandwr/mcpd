@@ -1,6 +1,6 @@
 [package]
 name = "mcpd"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 description = "Aggregates multiple MCP servers behind a single endpoint"
 license = "MIT"
@@ -19,3 +19,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6.0.0"
 which = "8.0.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+_test = []
+
+[[bin]]
+name = "mock-mcp-server"
+path = "test-support/mock_mcp_server.rs"
+required-features = ["_test"]

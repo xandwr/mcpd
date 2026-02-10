@@ -110,15 +110,9 @@ impl Server {
         let result = InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: true,
-                }),
-                resources: Some(ResourcesCapability {
-                    list_changed: true,
-                }),
-                prompts: Some(PromptsCapability {
-                    list_changed: true,
-                }),
+                tools: Some(ToolsCapability { list_changed: true }),
+                resources: Some(ResourcesCapability { list_changed: true }),
+                prompts: Some(PromptsCapability { list_changed: true }),
             },
             server_info: ServerInfo {
                 name: "mcpd".to_string(),

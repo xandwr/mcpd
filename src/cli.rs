@@ -120,3 +120,32 @@ impl Cli {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_var_valid() {
+        let result = parse_env_var("KEY=VALUE").unwrap();
+        assert_eq!(result, ("KEY".to_string(), "VALUE".to_string()));
+    }
+
+    #[test]
+    fn parse_env_var_with_equals_in_value() {
+        let result = parse_env_var("KEY=VAL=UE").unwrap();
+        assert_eq!(result, ("KEY".to_string(), "VAL=UE".to_string()));
+    }
+
+    #[test]
+    fn parse_env_var_empty_value() {
+        let result = parse_env_var("KEY=").unwrap();
+        assert_eq!(result, ("KEY".to_string(), "".to_string()));
+    }
+
+    #[test]
+    fn parse_env_var_missing_equals() {
+        let result = parse_env_var("KEYVALUE");
+        assert!(result.is_err());
+    }
+}

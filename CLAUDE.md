@@ -39,7 +39,25 @@ cargo install --path . # install locally
 cargo install mcpd     # install from crates.io
 ```
 
-No tests currently. No CI. No config files beyond Cargo.toml.
+## Testing
+
+```bash
+cargo test                  # unit tests only
+cargo test --features _test # all tests (unit + integration with mock MCP server)
+cargo clippy --all-targets --features _test -- -D warnings  # lint
+cargo fmt -- --check        # format check
+```
+
+Tests are organized as:
+- Inline `#[cfg(test)]` modules in `mcp.rs`, `registry.rs`, `cli.rs` for unit tests
+- `tests/integration.rs` for proxy integration tests using a mock MCP server
+- `test-support/mock_mcp_server.rs` is a minimal MCP server binary for testing (gated behind `_test` feature)
+
+## CI/CD
+
+CI runs on every push/PR to `main` (`.github/workflows/ci.yml`): check, clippy, fmt, test.
+
+Releases are triggered by pushing `v*` tags (`.github/workflows/release.yml`): verifies version match, runs tests, publishes to crates.io, creates GitHub Release. Requires `CARGO_REGISTRY_TOKEN` secret.
 
 ## Dependencies
 
