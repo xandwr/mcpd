@@ -290,7 +290,7 @@ pub struct CallToolParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<Content>,
-    #[serde(default)]
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -450,6 +450,18 @@ mod tests {
         let result: CallToolResult = serde_json::from_str(json_str).unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn call_tool_error_survives_proxy_round_trip() {
+        let wire =
+            json!({"content": [{"type": "text", "text": "scene unavailable"}], "isError": true});
+        let result: CallToolResult = serde_json::from_value(wire.clone()).unwrap();
+        assert!(result.is_error);
+        assert_eq!(serde_json::to_value(result).unwrap(), wire);
+        let legacy: CallToolResult =
+            serde_json::from_value(json!({"content": [], "is_error": true})).unwrap();
+        assert!(legacy.is_error);
     }
 
     #[test]
