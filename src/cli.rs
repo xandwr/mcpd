@@ -2,7 +2,7 @@
 
 use crate::registry::{Registry, Tool};
 use crate::server::Server;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -40,6 +40,18 @@ enum Commands {
 
     /// Run the aggregating MCP server (stdio mode)
     Serve,
+
+    #[command(about = "Install or update a bundled agent integration")]
+    Setup {
+        #[command(subcommand)]
+        client: SetupClient,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupClient {
+    #[command(about = "Install the Pi extension, then use /reload in Pi")]
+    Pi,
 }
 
 fn parse_env_var(s: &str) -> Result<(String, String), String> {
@@ -52,6 +64,45 @@ fn parse_env_var(s: &str) -> Result<(String, String), String> {
 impl Cli {
     pub async fn run(self) -> Result<()> {
         match self.command {
+            Commands::Setup {
+                client: SetupClient::Pi,
+            } => {
+                let agent_dir = match std::env::var_os("PI_CODING_AGENT_DIR") {
+                    Some(path) => std::path::PathBuf::from(path),
+                    None => dirs::home_dir()
+                        .context("Could not determine home directory")?
+                        .join(".pi/agent"),
+                };
+                let directory = agent_dir.join("extensions");
+                std::fs::create_dir_all(&directory)?;
+                let destination = directory.join("mcpd.ts");
+                let temporary = directory.join(format!(".mcpd-{}.tmp", std::process::id()));
+                let result = (|| -> Result<()> {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&temporary)?;
+                    file.write_all(include_str!("../integrations/pi.ts").as_bytes())?;
+                    file.sync_all()?;
+                    std::fs::rename(&temporary, &destination)?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+                result.with_context(|| {
+                    format!(
+                        "Failed to install Pi extension at {}",
+                        destination.display()
+                    )
+                })?;
+                println!("Installed Pi extension: {}", destination.display());
+                println!(
+                    "The extension runs mcpd from PATH. Use /reload in Pi or start a new session."
+                );
+                Ok(())
+            }
             Commands::Register { name, command, env } => {
                 let mut registry = Registry::load()?;
 
@@ -111,7 +162,7 @@ impl Cli {
                 let registry = Registry::load()?;
                 info!(
                     backends = registry.len(),
-                    "Starting MCP server (2 meta-tools: list_tools, use_tool)"
+                    "Starting MCP server (find_tools, list_tools, use_tool)"
                 );
 
                 let server = Server::new(registry);

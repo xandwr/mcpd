@@ -1,7 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
@@ -56,7 +54,7 @@ export default function (pi: ExtensionAPI) {
   async function connect() {
     if (ready) return ready;
     stderr = "";
-    const process = spawn(join(homedir(), ".cargo/bin/mcpd"), ["serve"], { stdio: "pipe" });
+    const process = spawn("mcpd", ["serve"], { stdio: "pipe" });
     child = process;
     process.stderr.on("data", (data) => { stderr = (stderr + data).slice(-8192); });
     process.stdin.on("error", (error) => { if (child === process) stop(error); });
@@ -95,14 +93,26 @@ export default function (pi: ExtensionAPI) {
     return ready;
   }
 
-  for (const name of ["list_tools", "use_tool"] as const) {
+  for (const name of ["find_tools", "list_tools", "use_tool"] as const) {
     pi.registerTool({
       name: `mcpd_${name}`,
       label: `mcpd ${name}`,
-      description: name === "list_tools"
-        ? "Discover tools from all registered mcpd servers, including Godot, with their input schemas. Call again after registering servers."
-        : "Invoke a backend tool using its server__tool name and arguments from mcpd_list_tools.",
-      parameters: (name === "list_tools"
+      description: name === "find_tools"
+        ? "Search locally registered MCP capabilities before deciding you lack a tool for a task. Matches keywords in server names, tool names, and descriptions. Returns bounded results with input schemas, server names, and backend errors. Omit query to browse; use server to scope discovery."
+        : name === "list_tools"
+        ? "List the complete tool catalog from all registered mcpd servers with input schemas. Use mcpd_find_tools for a focused search."
+        : "Invoke a backend tool using its server__tool name and arguments from mcpd_find_tools or mcpd_list_tools.",
+      parameters: (name === "find_tools"
+        ? {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Space-separated keywords. Matches any keyword; names rank above descriptions." },
+              server: { type: "string", description: "Optional exact registered server name." },
+              limit: { type: "integer", minimum: 1, maximum: 100, default: 10 },
+            },
+            additionalProperties: false,
+          }
+        : name === "list_tools"
         ? { type: "object", properties: {}, additionalProperties: false }
         : {
             type: "object",

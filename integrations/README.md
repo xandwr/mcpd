@@ -1,47 +1,44 @@
-# Local agent integrations
-
-## Codex
-
-Register the aggregator once:
-
-```sh
-codex mcp add mcpd -- "$HOME/.cargo/bin/mcpd" serve
-```
-
-Start a new Codex session after changing its MCP configuration. Discover backend tools with `list_tools`, then invoke their fully qualified names with `use_tool`.
+# Agent integrations
 
 ## Pi
 
-Link the extension into Pi's global extension directory:
+Install mcpd and its bundled extension:
 
 ```sh
-mkdir -p "$HOME/.pi/agent/extensions"
-ln -s /home/xander/Projects/mcpd/integrations/pi.ts "$HOME/.pi/agent/extensions/mcpd.ts"
+cargo install mcpd
+mcpd setup pi
 ```
 
-Use `/reload` in Pi or start a new session. The extension exposes `mcpd_list_tools` and `mcpd_use_tool`. It starts `$HOME/.cargo/bin/mcpd serve` on first use and closes the connection at session shutdown. Requests time out after 120 seconds. Cancellation closes the shared connection and rejects any pending calls; the next call reconnects. The bridge exposes tools only; resources and prompts remain available through native MCP clients such as Codex.
+Use `/reload` in Pi or start a new session. The extension exposes `mcpd_find_tools`, `mcpd_list_tools`, and `mcpd_use_tool`. Search by task keywords with `mcpd_find_tools`, then invoke a returned name using `mcpd_use_tool`. Use `mcpd_list_tools` when you need the complete catalog.
 
-The extension uses Node built-ins and Pi's extension API, with no additional runtime packages. Its source stays in this repository through the symlink.
+Setup copies the extension embedded in the installed binary into `~/.pi/agent/extensions/mcpd.ts`. It respects `PI_CODING_AGENT_DIR`. Re-run setup after upgrading mcpd; it replaces the previous copy or symlink. The extension runs `mcpd serve` from PATH on first use and closes the connection at session shutdown.
 
-## Godot setup on this machine
+Requests time out after 120 seconds. Cancellation closes the shared connection and rejects pending calls; the next call reconnects. The bridge exposes tools only. Resources and prompts remain available through native MCP clients.
+
+The extension uses Node built-ins and Pi's extension API, with no additional runtime packages.
+
+## Native MCP clients
+
+Configure a stdio server with command `mcpd` and arguments `["serve"]`. Discover backend tools with `find_tools`, then invoke their fully qualified names with `use_tool`. Restart the client connection after upgrading the binary.
+
+## Local development
+
+Build and install from the verified Cargo package, then reload Pi:
 
 ```sh
-cargo build --locked --release --manifest-path /home/xander/Projects/reflection-engine/tools/godot-mcp/Cargo.toml
-mcpd register godot /home/xander/Projects/reflection-engine/tools/godot-mcp/target/release/godot-mcp -e GODOT_BIN=/usr/bin/godot
+cargo test --locked --features _test
+cargo package --allow-dirty --locked
+cargo install --path target/package/mcpd-1.0.7 --locked --force
+mcpd setup pi
 ```
 
-Rebuild after editing the Godot server. Restart connected agent sessions to replace an already running backend process.
+`--allow-dirty` includes uncommitted changes without publishing them. Use the installed extension and binary for normal work. Source changes take effect after the next packaged installation and setup, just as they do for a user upgrading a release.
 
-Call `mcpd_list_tools` in Pi, then `mcpd_use_tool` with:
+To exercise the installed Pi bridge with an isolated registry and mock backend:
 
-```json
-{
-  "tool_name": "godot__godot_scene_inspect",
-  "arguments": {
-    "project_root": "/home/xander/Projects/reflection-engine",
-    "scene_path": "res://scenes/main.tscn"
-  }
-}
+```sh
+cargo build --locked --features _test --bin mock-mcp-server
+node --experimental-strip-types test-support/pi-smoke.mjs
 ```
 
-Use the equivalent `use_tool` in Codex. Close the project's GUI editor before scene inspection. Registration is shared through `~/.config/mcpd/registry.json`; project paths are supplied per tool call.
+This checks the installed `mcpd` from PATH, installs its bundled extension into a temporary Pi directory, and calls discovery and invocation through that extension. It does not modify your registered servers.

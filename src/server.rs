@@ -1,6 +1,4 @@
-//! Aggregating MCP server - exposes two meta-tools (list_tools, use_tool) and
-//! natively proxies resources and prompts from all registered backends.
-
+use crate::discovery::{BackendError, FindToolsParams, FindToolsResult, rank_tools};
 use crate::mcp::{
     CallToolParams, CallToolResult, Content, GetPromptParams, InitializeResult, ListPromptsResult,
     ListResourcesResult, ListToolsResult, Notification, PROTOCOL_VERSION, PromptsCapability,
@@ -17,9 +15,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
-/// Aggregating MCP server that exposes two static tools:
-/// - `list_tools`: discover all available tools from registered backends
-/// - `use_tool`: call any discovered tool by name
 pub struct Server {
     registry: Arc<RwLock<Registry>>,
     proxies: RwLock<HashMap<String, Arc<ToolProxy>>>,
@@ -131,9 +126,29 @@ impl Server {
         success_or_internal_error(id, &result)
     }
 
-    /// Handle tools/list - returns our two static meta-tools
     async fn handle_list_tools(&self, id: RequestId) -> Response {
         let tools = vec![
+            McpTool {
+                name: "find_tools".to_string(),
+                description: Some(
+                    "Find capabilities available through locally registered MCP servers. \
+                     Search before deciding you lack a tool for a task. Matches keywords against \
+                     server names, tool names, and descriptions, ranked by relevance. \
+                     Returns up to 10 matches with input schemas, registered server names, and \
+                     backend errors. Omit query to browse. Use server to scope discovery, \
+                     then invoke a matching server__tool with use_tool."
+                        .to_string(),
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Space-separated keywords, such as 'file search' or 'scene inspect'. Matches any keyword; names rank above descriptions."},
+                        "server": {"type": "string", "description": "Optional exact registered server name. Only this backend will be queried."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+                    },
+                    "additionalProperties": false
+                }),
+            },
             McpTool {
                 name: "list_tools".to_string(),
                 description: Some(
@@ -152,7 +167,7 @@ impl Server {
             McpTool {
                 name: "use_tool".to_string(),
                 description: Some(
-                    "Invoke a tool by name. Use `list_tools` first to discover \
+                    "Invoke a tool by name. Use `find_tools` or `list_tools` first to discover \
                      available tools and their expected arguments."
                         .to_string(),
                 ),
@@ -174,7 +189,7 @@ impl Server {
             },
         ];
 
-        info!(count = 2, "Serving static meta-tools");
+        info!(count = tools.len(), "Serving static meta-tools");
 
         let result = ListToolsResult { tools };
         success_or_internal_error(id, &result)
@@ -247,9 +262,40 @@ impl Server {
             .map_err(|e| format!("Tool call failed: {}", e))
     }
 
-    /// Handle tools/call request - dispatches list_tools and use_tool
     async fn handle_call_tool(&self, id: RequestId, params: CallToolParams) -> Response {
         match params.name.as_str() {
+            "find_tools" => {
+                let search =
+                    match serde_json::from_value::<FindToolsParams>(if params.arguments.is_null() {
+                        json!({})
+                    } else {
+                        params.arguments
+                    }) {
+                        Ok(search) => search,
+                        Err(e) => {
+                            return Response::error(id, -32602, format!("Invalid search: {}", e));
+                        }
+                    };
+                if let Err(e) = search.validate() {
+                    return Response::error(id, -32602, e);
+                }
+                let result = match self.find_tools(&search).await {
+                    Ok(found) => CallToolResult {
+                        content: vec![Content::Text {
+                            text: match serde_json::to_string(&found) {
+                                Ok(text) => text,
+                                Err(e) => return Response::error(id, -32603, e.to_string()),
+                            },
+                        }],
+                        is_error: false,
+                    },
+                    Err(error) => CallToolResult {
+                        content: vec![Content::Text { text: error }],
+                        is_error: true,
+                    },
+                };
+                success_or_internal_error(id, &result)
+            }
             "list_tools" => match self.aggregate_backend_tools().await {
                 Ok(tools) => {
                     let text = match serde_json::to_string_pretty(&tools) {
@@ -316,7 +362,7 @@ impl Server {
                 let result = CallToolResult {
                     content: vec![Content::Text {
                         text: format!(
-                            "Unknown tool '{}'. mcpd exposes two tools: list_tools and use_tool.",
+                            "Unknown tool '{}'. mcpd exposes find_tools, list_tools, and use_tool.",
                             other
                         ),
                     }],
@@ -325,6 +371,55 @@ impl Server {
                 success_or_internal_error(id, &result)
             }
         }
+    }
+
+    pub async fn find_tools(&self, params: &FindToolsParams) -> Result<FindToolsResult, String> {
+        params.validate()?;
+        self.sync_registry().await.map_err(|e| e.to_string())?;
+        let proxies = self.proxies.read().await;
+        let servers: Vec<_> = proxies.keys().cloned().collect();
+        if let Some(server) = &params.server
+            && !proxies.contains_key(server)
+        {
+            return Err(format!(
+                "Unknown server '{}'. Omit server to discover registered servers.",
+                server
+            ));
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for (name, proxy) in proxies.iter() {
+            if params.server.as_ref().is_some_and(|server| server != name) {
+                continue;
+            }
+            let name = name.clone();
+            let proxy = Arc::clone(proxy);
+            tasks.spawn(async move {
+                let result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    proxy.list_tools(),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(|e| e.to_string()),
+                    Err(_) => {
+                        let _ = proxy.stop().await;
+                        Err("Tool discovery timed out after 15 seconds".to_string())
+                    }
+                };
+                (name, result)
+            });
+        }
+        drop(proxies);
+        let mut catalogs = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let (server, result) = result.map_err(|e| format!("Discovery task failed: {}", e))?;
+            match result {
+                Ok(tools) => catalogs.push((server, tools)),
+                Err(error) => errors.push(BackendError { server, error }),
+            }
+        }
+        Ok(rank_tools(params, catalogs, servers, errors))
     }
 
     /// Namespace a backend URI into mcpd:// format, avoiding double-prefixing
