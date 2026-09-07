@@ -31,3 +31,8 @@ _test = []
 name = "mock-mcp-server"
 path = "test-support/mock_mcp_server.rs"
 required-features = ["_test"]
+
+[[bin]]
+name = "modern-mcp-server"
+path = "test-support/modern_mcp_server.rs"
+required-features = ["_test"]

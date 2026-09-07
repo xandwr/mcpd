@@ -1,29 +1,27 @@
 use crate::discovery::{BackendError, FindToolsParams, FindToolsResult, rank_tools};
 use crate::mcp::{
-    CallToolParams, CallToolResult, Content, GetPromptParams, InitializeResult, ListPromptsResult,
-    ListResourcesResult, ListToolsResult, Notification, PROTOCOL_VERSION, PromptsCapability,
-    ReadResourceParams, Request, RequestId, ResourcesCapability, Response, ServerCapabilities,
-    ServerInfo, Tool as McpTool, ToolsCapability,
+    LEGACY_PROTOCOL_VERSION, ListToolsResult, Notification, Request, RequestId, Response, RpcError,
+    Tool as McpTool,
 };
+use crate::protocol::{self, CAPABILITIES, SUBSCRIPTION_ID};
 use crate::proxy::ToolProxy;
 use crate::registry::Registry;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 pub struct Server {
-    registry: Arc<RwLock<Registry>>,
+    registry: RwLock<Registry>,
     proxies: RwLock<HashMap<String, Arc<ToolProxy>>>,
     initialized: RwLock<bool>,
-    /// Shared stdout handle for sending notifications outside request handling
-    stdout: Arc<Mutex<tokio::io::Stdout>>,
+    subscriptions: Mutex<HashMap<RequestId, Value>>,
+    stdout: Mutex<tokio::io::Stdout>,
 }
 
-/// Serialize a result to a JSON-RPC success response, returning an internal error response on failure.
 fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> Response {
     match serde_json::to_value(result) {
         Ok(value) => Response::success(id, value),
@@ -34,101 +32,513 @@ fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> R
 impl Server {
     pub fn new(registry: Registry) -> Self {
         Self {
-            registry: Arc::new(RwLock::new(registry)),
+            registry: RwLock::new(registry),
             proxies: RwLock::new(HashMap::new()),
             initialized: RwLock::new(false),
-            stdout: Arc::new(Mutex::new(tokio::io::stdout())),
+            subscriptions: Mutex::new(HashMap::new()),
+            stdout: Mutex::new(tokio::io::stdout()),
         }
     }
 
-    /// Reload registry from disk, sync proxies, and notify client if anything changed.
+    async fn write(&self, message: &impl serde::Serialize) -> Result<()> {
+        let mut line = serde_json::to_vec(message)?;
+        line.push(b'\n');
+        let mut stdout = self.stdout.lock().await;
+        stdout.write_all(&line).await?;
+        stdout.flush().await?;
+        Ok(())
+    }
+
     async fn sync_registry(&self) -> Result<()> {
         let mut registry = self.registry.write().await;
         registry.reload()?;
-        let new_names = registry.names();
-
+        let names = registry.names();
         let mut proxies = self.proxies.write().await;
         let mut changed = false;
-
-        // Add proxies for newly registered servers
         for tool in registry.list() {
             if !proxies.contains_key(&tool.name) {
-                info!(tool = %tool.name, "Creating proxy for new backend");
                 proxies.insert(tool.name.clone(), Arc::new(ToolProxy::new(tool.clone())));
                 changed = true;
             }
         }
-
-        // Remove proxies for unregistered servers
-        let stale: Vec<String> = proxies
+        let stale: Vec<_> = proxies
             .keys()
-            .filter(|name| !new_names.contains(*name))
+            .filter(|name| !names.contains(*name))
             .cloned()
             .collect();
-
         for name in stale {
             if let Some(proxy) = proxies.remove(&name) {
-                info!(tool = %name, "Removing proxy for unregistered backend");
                 let _ = proxy.stop().await;
             }
             changed = true;
         }
-
-        // Drop locks before sending notifications
         drop(proxies);
         drop(registry);
-
         if changed {
-            let initialized = *self.initialized.read().await;
-            if initialized {
-                info!("Registry changed, notifying client");
-                self.send_notification("notifications/tools/list_changed")
-                    .await?;
-                self.send_notification("notifications/resources/list_changed")
-                    .await?;
-                self.send_notification("notifications/prompts/list_changed")
-                    .await?;
+            for (method, filter) in [
+                ("notifications/tools/list_changed", "toolsListChanged"),
+                (
+                    "notifications/resources/list_changed",
+                    "resourcesListChanged",
+                ),
+                ("notifications/prompts/list_changed", "promptsListChanged"),
+            ] {
+                if *self.initialized.read().await {
+                    self.write(&Notification::new(method)).await?;
+                }
+                let subscriptions = self.subscriptions.lock().await;
+                for (id, filters) in subscriptions.iter() {
+                    if filters[filter] == true {
+                        self.write(&json!({"jsonrpc": "2.0", "method": method, "params": {"_meta": {SUBSCRIPTION_ID: id}}})).await?;
+                    }
+                }
             }
         }
-
         Ok(())
     }
 
-    /// Send a JSON-RPC notification to the client via stdout
-    async fn send_notification(&self, method: &str) -> Result<()> {
-        let notification = Notification::new(method);
-        let mut line = serde_json::to_string(&notification)?;
-        line.push('\n');
-        let mut stdout = self.stdout.lock().await;
-        stdout.write_all(line.as_bytes()).await?;
-        stdout.flush().await?;
-        debug!(method, "Sent notification to client");
+    fn capabilities() -> Value {
+        json!({"tools": {"listChanged": true}, "resources": {"listChanged": true}, "prompts": {"listChanged": true}})
+    }
+
+    async fn subscribe(&self, request: &Request) -> Result<(), RpcError> {
+        if !protocol::request_is_modern(request, *self.initialized.read().await)? {
+            return Err(protocol::invalid(
+                "subscriptions/listen requires modern request metadata",
+            ));
+        }
+        let params = request.params.as_ref().unwrap();
+        let filters = params
+            .get("notifications")
+            .and_then(Value::as_object)
+            .ok_or_else(|| protocol::invalid("Missing notifications filter"))?;
+        let mut accepted = json!({});
+        for key in [
+            "toolsListChanged",
+            "resourcesListChanged",
+            "promptsListChanged",
+        ] {
+            if let Some(value) = filters.get(key) {
+                let enabled = value
+                    .as_bool()
+                    .ok_or_else(|| protocol::invalid("Notification filters must be boolean"))?;
+                if enabled {
+                    accepted[key] = json!(true);
+                }
+            }
+        }
+        if let Some(uris) = filters.get("resourceSubscriptions")
+            && !uris
+                .as_array()
+                .is_some_and(|uris| uris.iter().all(Value::is_string))
+        {
+            return Err(protocol::invalid(
+                "resourceSubscriptions must be an array of URI strings",
+            ));
+        }
+        self.sync_registry()
+            .await
+            .map_err(|error| protocol::invalid(error.to_string()))?;
+        let mut subscriptions = self.subscriptions.lock().await;
+        self.write(&json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {
+            "_meta": {SUBSCRIPTION_ID: request.id}, "notifications": accepted
+        }})).await.map_err(|error| protocol::invalid(error.to_string()))?;
+        subscriptions.insert(request.id.clone(), accepted);
         Ok(())
     }
 
-    /// Handle initialize request
-    async fn handle_initialize(&self, id: RequestId) -> Response {
-        *self.initialized.write().await = true;
+    fn namespace_uri(server: &str, uri: &str) -> String {
+        format!(
+            "mcpd://{}/{}",
+            server,
+            uri.strip_prefix("mcpd://").unwrap_or(uri)
+        )
+    }
 
-        let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_string(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: true }),
-                resources: Some(ResourcesCapability { list_changed: true }),
-                prompts: Some(PromptsCapability { list_changed: true }),
-            },
-            server_info: ServerInfo {
-                name: "mcpd".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
+    fn namespace_content(server: &str, content: &mut Value) {
+        let resource = match content["type"].as_str() {
+            Some("resource_link") => content,
+            Some("resource") => &mut content["resource"],
+            _ => return,
         };
-
-        success_or_internal_error(id, &result)
+        if let Some(uri) = resource.get("uri").and_then(Value::as_str) {
+            resource["uri"] = json!(Self::namespace_uri(server, uri));
+        }
     }
 
+    async fn aggregate_catalog(&self, method: &str, field: &str) -> Result<Vec<Value>> {
+        self.sync_registry().await?;
+        let proxies: Vec<_> = self
+            .proxies
+            .read()
+            .await
+            .iter()
+            .map(|(name, proxy)| (name.clone(), Arc::clone(proxy)))
+            .collect();
+        let mut all = Vec::new();
+        for (server, proxy) in proxies {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                proxy.catalog(method, field),
+            )
+            .await
+            {
+                Ok(Ok(items)) => {
+                    for mut item in items {
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            item["name"] = json!(format!("{}__{}", server, name));
+                        }
+                        for key in ["uri", "uriTemplate"] {
+                            if let Some(uri) = item.get(key).and_then(Value::as_str) {
+                                item[key] = json!(Self::namespace_uri(&server, uri));
+                            }
+                        }
+                        all.push(item);
+                    }
+                }
+                Ok(Err(error)) => warn!(backend = %server, %error, "Backend catalog unavailable"),
+                Err(_) => {
+                    let _ = proxy.stop().await;
+                    warn!(backend = %server, "Backend catalog timed out");
+                }
+            }
+        }
+        all.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(all)
+    }
+
+    fn tool_result(value: Value) -> Value {
+        json!({"content": [{"type": "text", "text": value.to_string()}], "isError": false})
+    }
+
+    async fn route(&self, method: &str, mut params: Value, modern: bool) -> Result<Value> {
+        let key = if method == "resources/read" {
+            "uri"
+        } else {
+            "name"
+        };
+        let qualified = params[key]
+            .as_str()
+            .ok_or_else(|| protocol::invalid(format!("Missing {}", key)))?
+            .to_string();
+        let (server, original) = if method == "resources/read" {
+            qualified
+                .strip_prefix("mcpd://")
+                .and_then(|uri| uri.split_once('/'))
+                .ok_or_else(|| protocol::invalid("Expected mcpd://server/uri"))?
+        } else {
+            qualified
+                .split_once("__")
+                .ok_or_else(|| protocol::invalid("Expected server__name"))?
+        };
+        self.sync_registry().await?;
+        let proxy = self
+            .proxies
+            .read()
+            .await
+            .get(server)
+            .cloned()
+            .ok_or_else(|| protocol::invalid(format!("Unknown server '{}'", server)))?;
+        params[key] = json!(original);
+        if !modern {
+            params["_meta"] = json!({CAPABILITIES: {}});
+        }
+        if let Some(capabilities) = params
+            .get_mut("_meta")
+            .and_then(|meta| meta.get_mut(CAPABILITIES))
+            .and_then(Value::as_object_mut)
+        {
+            capabilities.remove("extensions");
+        }
+        let mut result = proxy.request(method, params.clone()).await?;
+        if result["resultType"] == "input_required" {
+            if !modern {
+                return Err(anyhow::anyhow!(
+                    "Backend requires a client supporting MCP 2026-07-28 multi round-trip requests"
+                ));
+            }
+            if result.get("inputRequests").is_none() && result.get("requestState").is_none() {
+                return Err(anyhow::anyhow!(
+                    "Backend returned input_required without input requests or state"
+                ));
+            }
+            if result
+                .get("requestState")
+                .is_some_and(|state| !state.is_string())
+                || result
+                    .get("inputRequests")
+                    .is_some_and(|inputs| !inputs.is_object())
+            {
+                return Err(anyhow::anyhow!(
+                    "Backend returned malformed input_required fields"
+                ));
+            }
+            if let Some(requests) = result.get("inputRequests").and_then(Value::as_object) {
+                for input in requests.values() {
+                    let capability = match input["method"].as_str() {
+                        Some("elicitation/create") => "elicitation",
+                        Some("roots/list") => "roots",
+                        Some("sampling/createMessage") => "sampling",
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Backend returned an unknown input request"
+                            ));
+                        }
+                    };
+                    let declared = params["_meta"][CAPABILITIES]
+                        .get(capability)
+                        .and_then(Value::as_object);
+                    let supported = declared.is_some_and(|declared| {
+                        if capability != "elicitation" {
+                            return true;
+                        }
+                        match input["params"]["mode"].as_str().unwrap_or("form") {
+                            "form" => {
+                                declared.is_empty()
+                                    || declared.get("form").is_some_and(Value::is_object)
+                            }
+                            "url" => declared.get("url").is_some_and(Value::is_object),
+                            _ => false,
+                        }
+                    });
+                    if !supported {
+                        return Err(RpcError {
+                            code: -32021,
+                            message: "Missing required client capability".into(),
+                            data: Some(json!({"requiredCapabilities": {capability: {}}})),
+                        }
+                        .into());
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        if let Some(contents) = result.get_mut("content").and_then(Value::as_array_mut) {
+            for content in contents {
+                Self::namespace_content(server, content);
+            }
+        }
+        if let Some(messages) = result.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                if let Some(content) = message.get_mut("content") {
+                    Self::namespace_content(server, content);
+                }
+            }
+        }
+        if method == "resources/read"
+            && let Some(contents) = result.get_mut("contents").and_then(Value::as_array_mut)
+        {
+            for content in contents {
+                if let Some(uri) = content.get("uri").and_then(Value::as_str) {
+                    content["uri"] = json!(Self::namespace_uri(server, uri));
+                }
+            }
+        }
+        if method == "tools/call" {
+            if let Some(error) = result
+                .as_object_mut()
+                .and_then(|object| object.remove("is_error"))
+            {
+                result["isError"] = error;
+            }
+            result
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Invalid backend result"))?
+                .entry("isError")
+                .or_insert(json!(false));
+        }
+        Ok(result)
+    }
+
+    async fn dispatch(&self, request: &Request, modern: bool) -> Result<Value> {
+        let params = request.params.clone().unwrap_or(json!({}));
+        match request.method.as_str() {
+            "server/discover" => Ok(
+                json!({"supportedVersions": protocol::supported_versions(), "capabilities": Self::capabilities(),
+                "instructions": "Search registered capabilities with find_tools, then call use_tool with a returned server__tool name and its arguments."}),
+            ),
+            "initialize" if !modern => {
+                serde_json::from_value::<crate::mcp::InitializeParams>(params)
+                    .map_err(|error| protocol::invalid(error.to_string()))?;
+                *self.initialized.write().await = true;
+                Ok(
+                    json!({"protocolVersion": LEGACY_PROTOCOL_VERSION, "capabilities": Self::capabilities(), "serverInfo": protocol::identity()}),
+                )
+            }
+            "ping" if !modern => Ok(json!({})),
+            "tools/list" => Ok(self
+                .handle_list_tools(request.id.clone())
+                .await
+                .result
+                .unwrap()),
+            "tools/call" => {
+                let name = params["name"]
+                    .as_str()
+                    .ok_or_else(|| protocol::invalid("Missing tool name"))?;
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                if !arguments.is_object() {
+                    return Err(protocol::invalid("Tool arguments must be an object").into());
+                }
+                match name {
+                    "find_tools" => {
+                        let search: FindToolsParams = serde_json::from_value(arguments)
+                            .map_err(|error| protocol::invalid(error.to_string()))?;
+                        search.validate().map_err(protocol::invalid)?;
+                        let found = self.find_tools(&search).await.map_err(anyhow::Error::msg)?;
+                        Ok(Self::tool_result(serde_json::to_value(found)?))
+                    }
+                    "list_tools" => {
+                        let mut tools = self.aggregate_catalog("tools/list", "tools").await?;
+                        for tool in &mut tools {
+                            if let Some(schema) = tool
+                                .as_object_mut()
+                                .and_then(|tool| tool.remove("inputSchema"))
+                            {
+                                tool["input_schema"] = schema;
+                            }
+                        }
+                        Ok(Self::tool_result(json!(tools)))
+                    }
+                    "use_tool" => {
+                        let tool = arguments["tool_name"]
+                            .as_str()
+                            .ok_or_else(|| protocol::invalid("Missing tool_name"))?;
+                        let mut backend_params = params.clone();
+                        backend_params["name"] = json!(tool);
+                        backend_params["arguments"] =
+                            arguments.get("arguments").cloned().unwrap_or(json!({}));
+                        self.route("tools/call", backend_params, modern).await
+                    }
+                    _ => Err(protocol::invalid(format!(
+                        "Unknown tool '{}'. Use find_tools, list_tools, or use_tool.",
+                        name
+                    ))
+                    .into()),
+                }
+            }
+            "resources/list" | "resources/templates/list" | "prompts/list" => {
+                let field = match request.method.as_str() {
+                    "resources/list" => "resources",
+                    "resources/templates/list" => "resourceTemplates",
+                    _ => "prompts",
+                };
+                Ok(json!({field: self.aggregate_catalog(&request.method, field).await?}))
+            }
+            "resources/read" | "prompts/get" => self.route(&request.method, params, modern).await,
+            _ => Err(RpcError {
+                code: -32601,
+                message: format!("Unknown method: {}", request.method),
+                data: None,
+            }
+            .into()),
+        }
+    }
+
+    async fn handle_request(&self, request: Request) -> Response {
+        let modern = match protocol::request_is_modern(&request, *self.initialized.read().await) {
+            Ok(modern) => modern,
+            Err(error) => return protocol::error_response(request.id, error),
+        };
+        let mut response = match self.dispatch(&request, modern).await {
+            Ok(result) => Response::success(request.id, result),
+            Err(error) => {
+                if let Some(rpc) = error.downcast_ref::<RpcError>() {
+                    protocol::error_response(request.id, rpc.clone())
+                } else if request.method == "tools/call" {
+                    Response::success(
+                        request.id,
+                        json!({"content": [{"type": "text", "text": error.to_string()}], "isError": true}),
+                    )
+                } else {
+                    Response::error(request.id, -32603, error.to_string())
+                }
+            }
+        };
+        protocol::finish(&mut response, &request.method, modern);
+        response
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let server = Arc::new(self);
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut active: HashMap<RequestId, tokio::task::AbortHandle> = HashMap::new();
+        loop {
+            tokio::select! {
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Ok((id, response))) = completed
+                        && active.remove(&id).is_some()
+                    {
+                        server.write(&response).await?;
+                    }
+                }
+                line = lines.next_line() => {
+                    let Some(line) = line? else { break };
+                    if line.trim().is_empty() { continue; }
+                    let value = match serde_json::from_str::<Value>(&line) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            server.write(&Response::error(RequestId::Null, -32700, "Parse error")).await?;
+                            continue;
+                        }
+                    };
+                    if value.get("id").is_none() && value.get("method").is_some() {
+                        if value["jsonrpc"] != "2.0" { continue; }
+                        if value["method"] == "notifications/cancelled"
+                            && let Ok(id) = serde_json::from_value::<RequestId>(value["params"]["requestId"].clone())
+                        {
+                            if let Some(handle) = active.remove(&id) { handle.abort(); }
+                            server.subscriptions.lock().await.remove(&id);
+                        }
+                        continue;
+                    }
+                    let request = match serde_json::from_value::<Request>(value) {
+                        Ok(request) => request,
+                        Err(_) => {
+                            server.write(&Response::error(RequestId::Null, -32600, "Invalid request")).await?;
+                            continue;
+                        }
+                    };
+                    if active.contains_key(&request.id) || server.subscriptions.lock().await.contains_key(&request.id) {
+                        server.write(&Response::error(request.id, -32600, "Request ID already in use")).await?;
+                        continue;
+                    }
+                    if request.method == "subscriptions/listen" {
+                        if let Err(error) = server.subscribe(&request).await {
+                            server.write(&protocol::error_response(request.id, error)).await?;
+                        }
+                    } else if request.method == "initialize" {
+                        let response = server.handle_request(request).await;
+                        server.write(&response).await?;
+                    } else {
+                        let id = request.id.clone();
+                        let server = Arc::clone(&server);
+                        let handle = tasks.spawn(async move {
+                            let response = server.handle_request(request).await;
+                            (response.id.clone(), response)
+                        });
+                        active.insert(id, handle);
+                    }
+                }
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        for (id, _) in server.subscriptions.lock().await.drain() {
+            let mut response =
+                Response::success(id.clone(), json!({"_meta": {SUBSCRIPTION_ID: id}}));
+            protocol::finish(&mut response, "subscriptions/listen", true);
+            server.write(&response).await?;
+        }
+        for proxy in server.proxies.read().await.values() {
+            let _ = proxy.stop().await;
+        }
+        Ok(())
+    }
     async fn handle_list_tools(&self, id: RequestId) -> Response {
         let tools = vec![
             McpTool {
+                extra: Default::default(),
                 name: "find_tools".to_string(),
                 description: Some(
                     "Find capabilities available through locally registered MCP servers. \
@@ -150,6 +560,7 @@ impl Server {
                 }),
             },
             McpTool {
+                extra: Default::default(),
                 name: "list_tools".to_string(),
                 description: Some(
                     "List all available tools from registered MCP backends. \
@@ -165,6 +576,7 @@ impl Server {
                 }),
             },
             McpTool {
+                extra: Default::default(),
                 name: "use_tool".to_string(),
                 description: Some(
                     "Invoke a tool by name. Use `find_tools` or `list_tools` first to discover \
@@ -193,184 +605,6 @@ impl Server {
 
         let result = ListToolsResult { tools };
         success_or_internal_error(id, &result)
-    }
-
-    /// Aggregate tools from all backend proxies
-    async fn aggregate_backend_tools(&self) -> Result<Vec<serde_json::Value>, String> {
-        if let Err(e) = self.sync_registry().await {
-            return Err(format!("Failed to ensure proxies: {}", e));
-        }
-
-        let proxies = self.proxies.read().await;
-        let mut all_tools = Vec::new();
-
-        for (proxy_name, proxy) in proxies.iter() {
-            match proxy.list_tools().await {
-                Ok(tools) => {
-                    for tool in tools {
-                        let prefixed_name = format!("{}__{}", proxy_name, tool.name);
-                        all_tools.push(json!({
-                            "name": prefixed_name,
-                            "description": tool.description.unwrap_or_default(),
-                            "input_schema": tool.input_schema,
-                        }));
-                    }
-                }
-                Err(e) => {
-                    warn!(proxy = %proxy_name, error = %e, "Failed to list tools from proxy");
-                }
-            }
-        }
-
-        info!(
-            count = all_tools.len(),
-            "Aggregated tools from all backends"
-        );
-        Ok(all_tools)
-    }
-
-    /// Route a use_tool call to the appropriate backend
-    async fn route_tool_call(
-        &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<CallToolResult, String> {
-        // Parse "proxyname__toolname" format
-        let (proxy_name, original_name) = tool_name
-            .split_once("__")
-            .ok_or_else(|| format!(
-                "Invalid tool name '{}'. Expected format: server__tool. Use list_tools to see available tools.",
-                tool_name
-            ))?;
-
-        let proxy = {
-            if let Err(e) = self.sync_registry().await {
-                return Err(format!("Failed to ensure proxies: {}", e));
-            }
-            let proxies = self.proxies.read().await;
-            proxies.get(proxy_name).cloned().ok_or_else(|| {
-                format!(
-                    "Unknown server '{}'. Use list_tools to see available tools.",
-                    proxy_name
-                )
-            })?
-        };
-
-        proxy
-            .call_tool(original_name, arguments)
-            .await
-            .map_err(|e| format!("Tool call failed: {}", e))
-    }
-
-    async fn handle_call_tool(&self, id: RequestId, params: CallToolParams) -> Response {
-        match params.name.as_str() {
-            "find_tools" => {
-                let search =
-                    match serde_json::from_value::<FindToolsParams>(if params.arguments.is_null() {
-                        json!({})
-                    } else {
-                        params.arguments
-                    }) {
-                        Ok(search) => search,
-                        Err(e) => {
-                            return Response::error(id, -32602, format!("Invalid search: {}", e));
-                        }
-                    };
-                if let Err(e) = search.validate() {
-                    return Response::error(id, -32602, e);
-                }
-                let result = match self.find_tools(&search).await {
-                    Ok(found) => CallToolResult {
-                        content: vec![Content::Text {
-                            text: match serde_json::to_string(&found) {
-                                Ok(text) => text,
-                                Err(e) => return Response::error(id, -32603, e.to_string()),
-                            },
-                        }],
-                        is_error: false,
-                    },
-                    Err(error) => CallToolResult {
-                        content: vec![Content::Text { text: error }],
-                        is_error: true,
-                    },
-                };
-                success_or_internal_error(id, &result)
-            }
-            "list_tools" => match self.aggregate_backend_tools().await {
-                Ok(tools) => {
-                    let text = match serde_json::to_string_pretty(&tools) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            return Response::error(
-                                id,
-                                -32603,
-                                format!("Failed to serialize tools: {}", e),
-                            );
-                        }
-                    };
-                    let result = CallToolResult {
-                        content: vec![Content::Text { text }],
-                        is_error: false,
-                    };
-                    success_or_internal_error(id, &result)
-                }
-                Err(e) => {
-                    let result = CallToolResult {
-                        content: vec![Content::Text {
-                            text: format!("Error listing tools: {}", e),
-                        }],
-                        is_error: true,
-                    };
-                    success_or_internal_error(id, &result)
-                }
-            },
-            "use_tool" => {
-                let tool_name = match params.arguments.get("tool_name").and_then(|v| v.as_str()) {
-                    Some(name) => name.to_string(),
-                    None => {
-                        let result = CallToolResult {
-                            content: vec![Content::Text {
-                                text: "Missing required parameter 'tool_name'. Use list_tools to discover available tools.".to_string(),
-                            }],
-                            is_error: true,
-                        };
-                        return success_or_internal_error(id, &result);
-                    }
-                };
-
-                let arguments = params
-                    .arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(json!({}));
-
-                match self.route_tool_call(&tool_name, arguments).await {
-                    Ok(result) => success_or_internal_error(id, &result),
-                    Err(e) => {
-                        error!(tool = %tool_name, error = %e, "use_tool failed");
-                        let result = CallToolResult {
-                            content: vec![Content::Text {
-                                text: format!("Error: {}", e),
-                            }],
-                            is_error: true,
-                        };
-                        success_or_internal_error(id, &result)
-                    }
-                }
-            }
-            other => {
-                let result = CallToolResult {
-                    content: vec![Content::Text {
-                        text: format!(
-                            "Unknown tool '{}'. mcpd exposes find_tools, list_tools, and use_tool.",
-                            other
-                        ),
-                    }],
-                    is_error: true,
-                };
-                success_or_internal_error(id, &result)
-            }
-        }
     }
 
     pub async fn find_tools(&self, params: &FindToolsParams) -> Result<FindToolsResult, String> {
@@ -421,328 +655,6 @@ impl Server {
         }
         Ok(rank_tools(params, catalogs, servers, errors))
     }
-
-    /// Namespace a backend URI into mcpd:// format, avoiding double-prefixing
-    /// if the backend URI itself starts with mcpd://.
-    fn namespace_uri(proxy_name: &str, uri: &str) -> String {
-        let raw = uri.strip_prefix("mcpd://").unwrap_or(uri);
-        format!("mcpd://{}/{}", proxy_name, raw)
-    }
-
-    // --- Resources ---
-
-    /// Aggregate resources from all backends, namespacing URIs
-    async fn handle_list_resources(&self, id: RequestId) -> Response {
-        if let Err(e) = self.sync_registry().await {
-            return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
-        }
-
-        let proxies = self.proxies.read().await;
-        let mut all_resources = Vec::new();
-
-        for (proxy_name, proxy) in proxies.iter() {
-            match proxy.list_resources().await {
-                Ok(resources) => {
-                    for mut resource in resources {
-                        // Namespace the URI: mcpd://server/original-uri
-                        resource.uri = Self::namespace_uri(proxy_name, &resource.uri);
-                        resource.name = format!("{}__{}", proxy_name, resource.name);
-                        all_resources.push(resource);
-                    }
-                }
-                Err(e) => {
-                    debug!(proxy = %proxy_name, error = %e, "Backend doesn't support resources (skipping)");
-                }
-            }
-        }
-
-        info!(
-            count = all_resources.len(),
-            "Aggregated resources from all backends"
-        );
-        let result = ListResourcesResult {
-            resources: all_resources,
-        };
-        success_or_internal_error(id, &result)
-    }
-
-    /// Route a resources/read call to the appropriate backend
-    async fn handle_read_resource(&self, id: RequestId, params: ReadResourceParams) -> Response {
-        // Parse "mcpd://server/original-uri"
-        let uri = &params.uri;
-        let stripped = match uri.strip_prefix("mcpd://") {
-            Some(s) => s,
-            None => {
-                return Response::error(
-                    id,
-                    -32602,
-                    format!(
-                        "Invalid resource URI '{}'. Expected mcpd://server/uri format.",
-                        uri
-                    ),
-                );
-            }
-        };
-
-        let (proxy_name, original_uri) = match stripped.split_once('/') {
-            Some((name, rest)) => (name, rest),
-            None => {
-                return Response::error(
-                    id,
-                    -32602,
-                    format!(
-                        "Invalid resource URI '{}'. Expected mcpd://server/uri format.",
-                        uri
-                    ),
-                );
-            }
-        };
-
-        let proxy = {
-            if let Err(e) = self.sync_registry().await {
-                return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
-            }
-            let proxies = self.proxies.read().await;
-            match proxies.get(proxy_name).cloned() {
-                Some(p) => p,
-                None => {
-                    return Response::error(
-                        id,
-                        -32602,
-                        format!("Unknown server '{}' in resource URI.", proxy_name),
-                    );
-                }
-            }
-        };
-
-        match proxy.read_resource(original_uri).await {
-            Ok(mut result) => {
-                // Re-namespace the URIs in the response
-                for content in &mut result.contents {
-                    content.uri = Self::namespace_uri(proxy_name, &content.uri);
-                }
-                success_or_internal_error(id, &result)
-            }
-            Err(e) => Response::error(id, -32603, format!("Failed to read resource: {}", e)),
-        }
-    }
-
-    // --- Prompts ---
-
-    /// Aggregate prompts from all backends, namespacing names
-    async fn handle_list_prompts(&self, id: RequestId) -> Response {
-        if let Err(e) = self.sync_registry().await {
-            return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
-        }
-
-        let proxies = self.proxies.read().await;
-        let mut all_prompts = Vec::new();
-
-        for (proxy_name, proxy) in proxies.iter() {
-            match proxy.list_prompts().await {
-                Ok(prompts) => {
-                    for mut prompt in prompts {
-                        prompt.name = format!("{}__{}", proxy_name, prompt.name);
-                        all_prompts.push(prompt);
-                    }
-                }
-                Err(e) => {
-                    debug!(proxy = %proxy_name, error = %e, "Backend doesn't support prompts (skipping)");
-                }
-            }
-        }
-
-        info!(
-            count = all_prompts.len(),
-            "Aggregated prompts from all backends"
-        );
-        let result = ListPromptsResult {
-            prompts: all_prompts,
-        };
-        success_or_internal_error(id, &result)
-    }
-
-    /// Route a prompts/get call to the appropriate backend
-    async fn handle_get_prompt(&self, id: RequestId, params: GetPromptParams) -> Response {
-        let (proxy_name, original_name) = match params.name.split_once("__") {
-            Some((server, name)) => (server.to_string(), name.to_string()),
-            None => {
-                return Response::error(
-                    id,
-                    -32602,
-                    format!(
-                        "Invalid prompt name '{}'. Expected format: server__prompt.",
-                        params.name
-                    ),
-                );
-            }
-        };
-
-        let proxy = {
-            if let Err(e) = self.sync_registry().await {
-                return Response::error(id, -32603, format!("Failed to ensure proxies: {}", e));
-            }
-            let proxies = self.proxies.read().await;
-            match proxies.get(&proxy_name).cloned() {
-                Some(p) => p,
-                None => {
-                    return Response::error(
-                        id,
-                        -32602,
-                        format!(
-                            "Unknown server '{}'. Use prompts/list to see available prompts.",
-                            proxy_name
-                        ),
-                    );
-                }
-            }
-        };
-
-        match proxy.get_prompt(&original_name, params.arguments).await {
-            Ok(result) => success_or_internal_error(id, &result),
-            Err(e) => Response::error(id, -32603, format!("Failed to get prompt: {}", e)),
-        }
-    }
-
-    /// Handle a single request
-    async fn handle_request(&self, request: Request) -> Response {
-        debug!(method = %request.method, id = ?request.id, "Handling request");
-
-        match request.method.as_str() {
-            "initialize" => self.handle_initialize(request.id).await,
-            "tools/list" => self.handle_list_tools(request.id).await,
-            "tools/call" => {
-                let params: CallToolParams = match request.params {
-                    Some(p) => match serde_json::from_value(p) {
-                        Ok(params) => params,
-                        Err(e) => {
-                            return Response::error(
-                                request.id,
-                                -32602,
-                                format!("Invalid params: {}", e),
-                            );
-                        }
-                    },
-                    None => {
-                        return Response::error(request.id, -32602, "Missing params");
-                    }
-                };
-                self.handle_call_tool(request.id, params).await
-            }
-            "resources/list" => self.handle_list_resources(request.id).await,
-            "resources/read" => {
-                let params: ReadResourceParams = match request.params {
-                    Some(p) => match serde_json::from_value(p) {
-                        Ok(params) => params,
-                        Err(e) => {
-                            return Response::error(
-                                request.id,
-                                -32602,
-                                format!("Invalid params: {}", e),
-                            );
-                        }
-                    },
-                    None => {
-                        return Response::error(request.id, -32602, "Missing params");
-                    }
-                };
-                self.handle_read_resource(request.id, params).await
-            }
-            "prompts/list" => self.handle_list_prompts(request.id).await,
-            "prompts/get" => {
-                let params: GetPromptParams = match request.params {
-                    Some(p) => match serde_json::from_value(p) {
-                        Ok(params) => params,
-                        Err(e) => {
-                            return Response::error(
-                                request.id,
-                                -32602,
-                                format!("Invalid params: {}", e),
-                            );
-                        }
-                    },
-                    None => {
-                        return Response::error(request.id, -32602, "Missing params");
-                    }
-                };
-                self.handle_get_prompt(request.id, params).await
-            }
-            _ => Response::error(
-                request.id,
-                -32601,
-                format!("Unknown method: {}", request.method),
-            ),
-        }
-    }
-
-    /// Handle a notification (no response)
-    async fn handle_notification(&self, notification: Notification) {
-        debug!(method = %notification.method, "Handling notification");
-
-        match notification.method.as_str() {
-            "notifications/initialized" => {
-                info!("Client initialized");
-            }
-            "notifications/cancelled" => {
-                // Handle cancellation if needed
-            }
-            _ => {
-                debug!(method = %notification.method, "Unknown notification");
-            }
-        }
-    }
-
-    /// Run the server on stdio
-    pub async fn run(&self) -> Result<()> {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-
-        info!("MCP server starting on stdio");
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await?;
-
-            if bytes_read == 0 {
-                info!("EOF received, shutting down");
-                break;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            debug!(line = %line, "Received message");
-
-            // Try to parse as request first
-            if let Ok(request) = serde_json::from_str::<Request>(line) {
-                let response = self.handle_request(request).await;
-                let mut response_line = serde_json::to_string(&response)?;
-                response_line.push('\n');
-                let mut stdout = self.stdout.lock().await;
-                stdout.write_all(response_line.as_bytes()).await?;
-                stdout.flush().await?;
-                continue;
-            }
-
-            // Try as notification
-            if let Ok(notification) = serde_json::from_str::<Notification>(line) {
-                self.handle_notification(notification).await;
-                continue;
-            }
-
-            warn!(line = %line, "Failed to parse message");
-        }
-
-        // Clean up proxies
-        let proxies = self.proxies.read().await;
-        for proxy in proxies.values() {
-            let _ = proxy.stop().await;
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -758,7 +670,6 @@ mod tests {
 
     #[test]
     fn namespace_uri_already_prefixed() {
-        // A backend that returns a URI starting with mcpd:// should not get double-prefixed
         let result = Server::namespace_uri("myserver", "mcpd://other/resource");
         assert_eq!(result, "mcpd://myserver/other/resource");
     }
@@ -779,7 +690,6 @@ mod tests {
 
     #[test]
     fn success_or_internal_error_with_unserializable_value() {
-        // A type whose Serialize impl always fails
         struct AlwaysFail;
         impl serde::Serialize for AlwaysFail {
             fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {

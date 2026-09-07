@@ -6,7 +6,7 @@ mcpd is a daemon that aggregates multiple MCP (Model Context Protocol) servers i
 
 **Repository:** https://github.com/xandwr/mcpd
 **Crate:** https://crates.io/crates/mcpd
-**MCP spec version:** 2025-11-25
+**MCP spec versions:** 2026-07-28 and legacy 2025-11-25
 
 ## Architecture
 
@@ -20,8 +20,9 @@ Source files in `src/`:
 - **cli.rs** - clap-based CLI. Subcommands: `register`, `unregister`, `list`, `serve`, `setup pi`. Setup installs the bundled Pi extension. Resolves command paths via `which`.
 - **discovery.rs** - Search parameters, ranked tool results, and keyword matching without extra dependencies.
 - **server.rs** - The aggregating MCP server. Listens on stdin/stdout. Exposes three meta-tools (`find_tools`, `list_tools`, `use_tool`) and natively proxies resources and prompts. Syncs registry from disk on every request and sends `list_changed` notifications on changes.
-- **proxy.rs** - `ToolProxy` manages one backend subprocess. Handles spawn, MCP initialization handshake, JSON-RPC request/response matching via oneshot channels, and clean shutdown. On-demand - only starts when needed.
+- **proxy.rs** - `ToolProxy` manages one backend subprocess. Handles spawn, modern discovery with legacy handshake fallback, queued writes, JSON-RPC response matching, pagination, cancellation, and shutdown. On-demand - only starts when needed.
 - **registry.rs** - Persistent JSON storage at `~/.config/mcpd/registry.json`. Stores tool name, command (resolved path + args), and per-server environment variables. Supports reload from disk.
+- **protocol.rs** - Modern request validation, version errors, server identity, and result/cache metadata.
 - **mcp.rs** - All MCP/JSON-RPC protocol types. Request, Response, Notification, plus MCP-specific types for tools, resources, prompts. No logic, just serialization.
 
 ## Key design decisions
@@ -30,7 +31,7 @@ Source files in `src/`:
 - **Namespace isolation:** All names use `server__name` format (double underscore). Resource URIs use `mcpd://server/original-uri`.
 - **Filesystem as coordination:** Registry is re-read from disk on every request. No file watchers, no IPC. `mcpd register` writes JSON, `mcpd serve` reads it. Simple.
 - **Graceful degradation:** Backends that don't support resources or prompts are silently skipped (logged at debug level).
-- **Background response reader:** Each proxy dispatches responses to pending requests using oneshot channels. Initialization is serialized separately.
+- **Background response reader:** Each proxy dispatches responses to pending requests using oneshot channels. Protocol detection is serialized separately. The server handles requests concurrently and cancels them by request ID.
 
 ## Building and running
 

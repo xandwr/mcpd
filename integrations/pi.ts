@@ -7,6 +7,7 @@ export default function (pi: ExtensionAPI) {
   let ready: Promise<void> | undefined;
   let sequence = 0;
   let stderr = "";
+  const protocolVersion = "2026-07-28";
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
 
   function stop(error = new Error("mcpd connection closed")) {
@@ -39,12 +40,24 @@ export default function (pi: ExtensionAPI) {
         if (error) reject(error);
         else resolve(result);
       };
-      const abort = () => stop(new Error("mcpd request aborted"));
-      const timer = setTimeout(() => stop(new Error(`mcpd ${method} timed out`)), 120000);
+      const cancel = (error: Error) => {
+        try { send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); }
+        catch {}
+        finish(error);
+      };
+      const abort = () => cancel(new Error("mcpd request aborted"));
+      const timer = setTimeout(() => cancel(new Error(`mcpd ${method} timed out`)), 120000);
       pending.set(id, { resolve: (value) => finish(undefined, value), reject: (error) => finish(error) });
       signal?.addEventListener("abort", abort, { once: true });
       try {
-        send({ jsonrpc: "2.0", id, method, params });
+        send({ jsonrpc: "2.0", id, method, params: {
+          ...params,
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": protocolVersion,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { name: "pi-mcpd", version: "1.0.0" },
+          },
+        } });
       } catch (error) {
         finish(error as Error);
       }
@@ -67,26 +80,18 @@ export default function (pi: ExtensionAPI) {
       if (child !== process) return;
       try {
         const message = JSON.parse(line);
-        if (message.method) {
-          if (message.id !== undefined) {
-            send(message.method === "ping"
-              ? { jsonrpc: "2.0", id: message.id, result: {} }
-              : { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Unsupported method" } });
-          }
-          return;
-        }
+        if (message.method) return;
         const waiting = pending.get(message.id);
         if (message.error) waiting?.reject(new Error(message.error.message));
+        else if (typeof message.result?.resultType !== "string") waiting?.reject(new Error("mcpd response omitted resultType; update mcpd and run mcpd setup pi"));
         else waiting?.resolve(message.result);
       } catch (error) {
         stop(error as Error);
       }
     });
-    ready = request("initialize", {
-      protocolVersion: "2025-11-25",
-      capabilities: {},
-      clientInfo: { name: "pi-mcpd", version: "1.0.0" },
-    }).then(() => { send({ jsonrpc: "2.0", method: "notifications/initialized" }); }).catch((error) => {
+    ready = request("server/discover", {}).then((result) => {
+      if (!result.supportedVersions?.includes(protocolVersion)) throw new Error(`mcpd does not support MCP ${protocolVersion}`);
+    }).catch((error) => {
       if (child === process) stop(error);
       throw error;
     });
@@ -123,9 +128,18 @@ export default function (pi: ExtensionAPI) {
       async execute(_id, params, signal) {
         signal?.throwIfAborted();
         await connect();
-        const result = await request("tools/call", { name, arguments: params }, signal);
+        let requestParams: any = { name, arguments: params };
+        let result = await request("tools/call", requestParams, signal);
+        for (let retry = 0; result.resultType === "input_required" && retry < 3; retry++) {
+          if (result.inputRequests && Object.keys(result.inputRequests).length) throw new Error("This Pi bridge does not support MCP client input requests");
+          if (typeof result.requestState !== "string") throw new Error("Backend requested a retry without requestState");
+          requestParams = { name, arguments: params, requestState: result.requestState };
+          result = await request("tools/call", requestParams, signal);
+        }
+        if (result.resultType !== "complete") throw new Error(`Backend did not complete the request (${result.resultType})`);
         const content = (result.content ?? []).map((item: any) =>
           item.type === "text" || item.type === "image" ? item : { type: "text", text: JSON.stringify(item) });
+        if (!content.length && "structuredContent" in result) content.push({ type: "text", text: JSON.stringify(result.structuredContent) });
         if (result.isError) throw new Error(content.map((item: any) => item.text ?? JSON.stringify(item)).join("\n"));
         return { content, details: result };
       },

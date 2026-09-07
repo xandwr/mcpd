@@ -30,6 +30,8 @@ pub struct FoundTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +85,7 @@ pub fn rank_tools(
                         name,
                         description,
                         input_schema: tool.input_schema,
+                        extra: tool.extra,
                     },
                 ));
             }
@@ -125,16 +128,19 @@ mod tests {
                     Tool {
                         name: "describe".into(),
                         description: Some("Echo something".into()),
+                        extra: Default::default(),
                         input_schema: json!({}),
                     },
                     Tool {
                         name: "echo".into(),
                         description: None,
+                        extra: Default::default(),
                         input_schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "fail".into(),
                         description: None,
+                        extra: Default::default(),
                         input_schema: json!({}),
                     },
                 ],
@@ -160,11 +166,13 @@ mod tests {
                         Tool {
                             name: "z".into(),
                             description: None,
+                            extra: Default::default(),
                             input_schema: json!({}),
                         },
                         Tool {
                             name: "a".into(),
                             description: None,
+                            extra: Default::default(),
                             input_schema: json!({}),
                         },
                     ],

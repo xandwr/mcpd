@@ -2,7 +2,7 @@
 
 Register MCP servers once. Give your agents one connection.
 
-mcpd routes tools, resources, and prompts from registered stdio servers through a single MCP endpoint. Backends start on demand; registration changes take effect on the next discovery call.
+mcpd routes tools, resources, and prompts from registered stdio servers through a single MCP endpoint. Backends start on demand; registration changes take effect on the next discovery call. Supports MCP 2026-07-28 and legacy 2025-11-25 clients and servers.
 
 ## Install and connect
 

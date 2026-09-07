@@ -1,39 +1,68 @@
-//! Tool proxy - manages subprocess communication with MCP tool servers.
-
 use crate::mcp::{
-    self, CallToolParams, CallToolResult, GetPromptParams, GetPromptResult, InitializeParams,
-    InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult, Notification,
-    PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Request, RequestId, Resource,
-    Response, Tool as McpTool,
+    CallToolResult, GetPromptResult, InitializeParams, InitializeResult, LEGACY_PROTOCOL_VERSION,
+    Notification, PROTOCOL_VERSION, Prompt, ReadResourceResult, Request, RequestId, Resource,
+    Response, RpcError, Tool as McpTool,
 };
+use crate::protocol::{self, CAPABILITIES, CLIENT_INFO, VERSION};
 use crate::registry::Tool;
 use anyhow::{Context, Result, anyhow};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, oneshot};
-use tracing::{debug, info, warn};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::{debug, warn};
 
-/// Proxy for communicating with a single MCP tool subprocess
+type Pending = Arc<std::sync::Mutex<HashMap<i64, oneshot::Sender<Response>>>>;
+type Input = mpsc::UnboundedSender<Vec<u8>>;
+
 pub struct ToolProxy {
     tool: Tool,
     state: Mutex<ProxyState>,
-    /// Serializes initialization attempts so only one caller performs the handshake.
-    /// Separate from `state` because `initialize()` needs to acquire `state` internally.
     init_lock: Mutex<()>,
     next_id: AtomicI64,
+    modern: Arc<AtomicBool>,
 }
 
 struct ProxyState {
     process: Option<Child>,
-    stdin: Option<ChildStdin>,
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Response>>>>,
-    initialized: bool,
+    stdin: Option<Input>,
+    pending: Pending,
+    protocol: Option<String>,
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    writer_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct PendingRequest {
+    id: i64,
+    pending: Pending,
+    stdin: Input,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if self.pending.lock().unwrap().remove(&self.id).is_some() {
+            let message = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": self.id}});
+            let _ = write_message(&self.stdin, &message);
+        }
+    }
+}
+
+fn write_message(stdin: &Input, message: &impl serde::Serialize) -> Result<()> {
+    let mut line = serde_json::to_vec(message)?;
+    line.push(b'\n');
+    stdin
+        .send(line)
+        .map_err(|_| anyhow!("Backend writer closed"))
+}
+
+fn fail_pending(pending: &Pending, message: &str) {
+    for (id, tx) in pending.lock().unwrap().drain() {
+        let _ = tx.send(Response::error(RequestId::Number(id), -32603, message));
+    }
 }
 
 impl ToolProxy {
@@ -43,350 +72,349 @@ impl ToolProxy {
             state: Mutex::new(ProxyState {
                 process: None,
                 stdin: None,
-                pending: Arc::new(Mutex::new(HashMap::new())),
-                initialized: false,
+                pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                protocol: None,
                 reader_task: None,
+                writer_task: None,
             }),
             init_lock: Mutex::new(()),
             next_id: AtomicI64::new(1),
+            modern: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Start the subprocess if not already running
     pub async fn start(&self) -> Result<()> {
         let mut state = self.state.lock().await;
-
-        // Check if already running
-        if let Some(ref mut child) = state.process
+        if let Some(child) = state.process.as_mut()
             && child.try_wait()?.is_none()
         {
             return Ok(());
         }
-
-        // Abort old reader task if any
         if let Some(handle) = state.reader_task.take() {
             handle.abort();
         }
-
-        info!(tool = %self.tool.name, command = ?self.tool.command, "Starting tool subprocess");
-
-        let mut cmd = Command::new(&self.tool.command[0]);
-        if self.tool.command.len() > 1 {
-            cmd.args(&self.tool.command[1..]);
+        if let Some(handle) = state.writer_task.take() {
+            handle.abort();
         }
-        cmd.stdin(Stdio::piped())
+        fail_pending(&state.pending, "Proxy restarted");
+        let command = self
+            .tool
+            .command
+            .first()
+            .context("Backend command is empty")?;
+        let mut child = Command::new(command)
+            .args(&self.tool.command[1..])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .envs(&self.tool.env);
-
-        let mut child = cmd
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .envs(&self.tool.env)
             .spawn()
-            .with_context(|| format!("Failed to spawn tool: {}", self.tool.name))?;
-
-        info!(tool = %self.tool.name, pid = ?child.id(), "Tool subprocess started");
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("Failed to capture stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("Failed to capture stdout"))?;
-
-        state.process = Some(child);
-        state.stdin = Some(stdin);
-        state.initialized = false;
-
-        // Clear old pending requests
-        {
-            let mut pending = state.pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Response::error(RequestId::Number(0), -1, "Proxy restarted"));
-            }
-        }
-
-        // Spawn background reader task that owns stdout and dispatches responses
+            .with_context(|| format!("Failed to spawn backend: {}", self.tool.name))?;
+        let mut input = child.stdin.take().context("Missing stdin")?;
+        let (stdin, mut outgoing) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending = Arc::clone(&state.pending);
-        let tool_name = self.tool.name.clone();
-        state.reader_task = Some(tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => {
-                        debug!(tool = %tool_name, "EOF from subprocess reader");
-                        // Cancel all pending requests on EOF
-                        let mut pending = pending.lock().await;
-                        for (_, tx) in pending.drain() {
-                            let _ = tx.send(Response::error(
-                                RequestId::Number(0),
-                                -1,
-                                "EOF from subprocess",
-                            ));
-                        }
-                        break;
-                    }
-                    Ok(_) => {
-                        debug!(tool = %tool_name, line = %line.trim(), "Received line");
-
-                        let response: Response = match serde_json::from_str(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                warn!(tool = %tool_name, error = %e, line = %line.trim(), "Invalid JSON from subprocess");
-                                continue;
-                            }
-                        };
-
-                        let response_id = match &response.id {
-                            RequestId::Number(n) => *n,
-                            RequestId::String(_) => continue,
-                        };
-
-                        let mut pending = pending.lock().await;
-                        if let Some(tx) = pending.remove(&response_id) {
-                            let _ = tx.send(response);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(tool = %tool_name, error = %e, "Read error from subprocess");
-                        let mut pending = pending.lock().await;
-                        for (_, tx) in pending.drain() {
-                            let _ = tx.send(Response::error(
-                                RequestId::Number(0),
-                                -1,
-                                "Read error from subprocess",
-                            ));
-                        }
-                        break;
-                    }
+        state.writer_task = Some(tokio::spawn(async move {
+            while let Some(line) = outgoing.recv().await {
+                if input.write_all(&line).await.is_err() || input.flush().await.is_err() {
+                    break;
                 }
             }
+            fail_pending(&pending, "Backend writer closed");
         }));
-
+        let stdout = child.stdout.take().context("Missing stdout")?;
+        state.stdin = Some(stdin.clone());
+        state.process = Some(child);
+        state.protocol = None;
+        self.modern.store(false, Ordering::SeqCst);
+        let modern = Arc::clone(&self.modern);
+        let pending = Arc::clone(&state.pending);
+        let name = self.tool.name.clone();
+        state.reader_task = Some(tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    warn!(backend = %name, "Invalid JSON from backend");
+                    continue;
+                };
+                if value.get("method").is_some() {
+                    if let Some(id) = value.get("id") {
+                        if modern.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let reply = if value["method"] == "ping" {
+                            json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                        } else {
+                            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Client capability not supported"}})
+                        };
+                        let _ = write_message(&stdin, &reply);
+                    }
+                    continue;
+                }
+                let Ok(response) = serde_json::from_value::<Response>(value) else {
+                    continue;
+                };
+                if let RequestId::Number(id) = response.id
+                    && let Some(tx) = pending.lock().unwrap().remove(&id)
+                {
+                    let _ = tx.send(response);
+                }
+            }
+            fail_pending(&pending, "Backend connection closed");
+        }));
         Ok(())
     }
 
-    /// Stop the subprocess
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().await;
-
         state.stdin.take();
-
+        if let Some(handle) = state.writer_task.take() {
+            handle.abort();
+        }
         if let Some(handle) = state.reader_task.take() {
             handle.abort();
         }
-
         if let Some(mut child) = state.process.take() {
-            info!(tool = %self.tool.name, "Stopping tool subprocess");
             let _ = child.kill().await;
         }
-
-        // Cancel all pending requests
-        {
-            let mut pending = state.pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Response::error(RequestId::Number(0), -1, "Proxy stopped"));
-            }
-        }
-
-        state.initialized = false;
+        fail_pending(&state.pending, "Proxy stopped");
+        state.protocol = None;
         Ok(())
     }
 
-    /// Perform MCP initialization handshake
-    async fn initialize(&self) -> Result<InitializeResult> {
+    async fn negotiate(&self) -> Result<String> {
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.call::<Value>(
+                "server/discover",
+                Some(json!({"_meta": protocol::metadata()})),
+            ),
+        )
+        .await;
+        match probe {
+            Ok(Ok(result)) => {
+                if result["resultType"] != "complete" {
+                    return Err(anyhow!("Invalid server/discover result"));
+                }
+                let versions = result["supportedVersions"]
+                    .as_array()
+                    .context("Missing supportedVersions")?;
+                if !versions.iter().any(|version| version == PROTOCOL_VERSION) {
+                    return Err(anyhow!(
+                        "Backend has no compatible modern protocol version: {}",
+                        result["supportedVersions"]
+                    ));
+                }
+                return Ok(PROTOCOL_VERSION.into());
+            }
+            Ok(Err(error))
+                if error
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|error| matches!(error.code, -32022..=-32020)) =>
+            {
+                return Err(error.context(
+                    "Modern backend rejected discovery; legacy fallback is not applicable",
+                ));
+            }
+            _ => {}
+        }
         let params = InitializeParams {
-            protocol_version: PROTOCOL_VERSION.to_string(),
+            protocol_version: LEGACY_PROTOCOL_VERSION.into(),
             capabilities: Default::default(),
-            client_info: mcp::ClientInfo {
-                name: "mcpd".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
+            client_info: crate::mcp::ClientInfo {
+                name: "mcpd".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
             },
         };
-
-        let result: InitializeResult = self
-            .call("initialize", Some(serde_json::to_value(params)?))
-            .await?;
-
-        info!(
-            tool = %self.tool.name,
-            server = %result.server_info.name,
-            version = %result.server_info.version,
-            "Tool initialized"
-        );
-
-        // Send initialized notification
-        self.notify("notifications/initialized").await?;
-
-        Ok(result)
-    }
-
-    /// Ensure the proxy is started and initialized.
-    /// Uses a dedicated init_lock to serialize initialization attempts without
-    /// holding the state lock (which initialize() needs internally).
-    pub async fn ensure_ready(&self) -> Result<()> {
-        self.start().await?;
-
-        // Fast path: already initialized
-        {
-            let state = self.state.lock().await;
-            if state.initialized {
-                return Ok(());
-            }
+        let result: InitializeResult = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.call("initialize", Some(serde_json::to_value(params)?)),
+        )
+        .await
+        .context("Backend initialization timed out")??;
+        if result.protocol_version != LEGACY_PROTOCOL_VERSION {
+            return Err(anyhow!(
+                "Unsupported legacy backend protocol version: {}",
+                result.protocol_version
+            ));
         }
-
-        // Slow path: acquire init_lock to serialize concurrent init attempts
-        let _init_guard = self.init_lock.lock().await;
-
-        // Re-check under init_lock — another caller may have finished first
-        {
-            let state = self.state.lock().await;
-            if state.initialized {
-                return Ok(());
-            }
-        }
-
-        self.initialize().await?;
-
-        let mut state = self.state.lock().await;
-        state.initialized = true;
-
-        Ok(())
-    }
-
-    /// Send a notification (no response expected)
-    async fn notify(&self, method: &str) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let stdin = state
+        let stdin = self
+            .state
+            .lock()
+            .await
             .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("Process not started"))?;
+            .clone()
+            .context("Backend disconnected")?;
+        write_message(&stdin, &Notification::new("notifications/initialized"))?;
+        Ok(LEGACY_PROTOCOL_VERSION.into())
+    }
 
-        let notification = Notification::new(method);
-        let mut line = serde_json::to_string(&notification)?;
-        line.push('\n');
-
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
-
-        debug!(tool = %self.tool.name, method, "Sent notification");
+    pub async fn ensure_ready(&self) -> Result<()> {
+        let _guard = self.init_lock.lock().await;
+        let unfinished = {
+            let state = self.state.lock().await;
+            state.process.is_some() && state.protocol.is_none()
+        };
+        if unfinished {
+            self.stop().await?;
+        }
+        self.start().await?;
+        if self.state.lock().await.protocol.is_none() {
+            let version = self.negotiate().await?;
+            debug!(backend = %self.tool.name, protocol = %version, "Backend ready");
+            self.modern
+                .store(version == PROTOCOL_VERSION, Ordering::SeqCst);
+            self.state.lock().await.protocol = Some(version);
+        }
         Ok(())
     }
 
-    /// Make a JSON-RPC call and wait for response
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params: Option<Value>,
     ) -> Result<T> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let request = Request::new(id, method, params);
-
-        let rx = {
-            let mut state = self.state.lock().await;
-            let stdin = state
-                .stdin
-                .as_mut()
-                .ok_or_else(|| anyhow!("Process not started"))?;
-
-            let mut line = serde_json::to_string(&request)?;
-            line.push('\n');
-
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await?;
-
-            debug!(tool = %self.tool.name, id, method, "Sent request");
-
-            // Set up response channel
-            let (tx, rx) = oneshot::channel();
-            state.pending.lock().await.insert(id, tx);
-
-            rx
+        let (stdin, pending, modern) = {
+            let state = self.state.lock().await;
+            (
+                state.stdin.clone().context("Process not started")?,
+                Arc::clone(&state.pending),
+                state.protocol.as_deref() == Some(PROTOCOL_VERSION),
+            )
         };
-
-        // Wait for the background reader to deliver our response
-        let response = rx.await.map_err(|_| anyhow!("Response channel closed"))?;
-
-        if let Some(err) = response.error {
-            return Err(anyhow!("RPC error {}: {}", err.code, err.message));
+        let mut params = params.unwrap_or(json!({}));
+        if modern {
+            let object = params
+                .as_object_mut()
+                .context("Request parameters must be an object")?;
+            let meta = object
+                .entry("_meta")
+                .or_insert(json!({}))
+                .as_object_mut()
+                .context("Request metadata must be an object")?;
+            meta.insert(VERSION.into(), json!(PROTOCOL_VERSION));
+            meta.entry(CAPABILITIES).or_insert(json!({}));
+            meta.insert(CLIENT_INFO.into(), protocol::identity());
         }
-
-        let result = response
-            .result
-            .ok_or_else(|| anyhow!("No result in response"))?;
-
+        let request = Request::new(id, method, Some(params));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert(id, tx);
+        let _guard = PendingRequest {
+            id,
+            pending,
+            stdin: stdin.clone(),
+        };
+        write_message(&stdin, &request)?;
+        let response = rx.await.context("Response channel closed")?;
+        if let Some(error) = response.error {
+            return Err(error.into());
+        }
+        let result = response.result.context("No result in response")?;
+        if modern && !result.get("resultType").is_some_and(Value::is_string) {
+            return Err(anyhow!("Modern backend omitted resultType"));
+        }
         serde_json::from_value(result).context("Failed to parse response")
     }
 
-    /// List tools from this server
+    pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
+        self.ensure_ready().await?;
+        if self.state.lock().await.protocol.as_deref() == Some(LEGACY_PROTOCOL_VERSION)
+            && let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut)
+        {
+            meta.remove(VERSION);
+            meta.remove(CAPABILITIES);
+            meta.remove(CLIENT_INFO);
+        }
+        self.call(method, Some(params)).await
+    }
+
+    pub async fn catalog(&self, method: &str, field: &str) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
+        let mut params = json!({});
+        let mut seen = HashSet::new();
+        loop {
+            let result = self.request(method, params.clone()).await?;
+            items.extend(
+                result[field]
+                    .as_array()
+                    .context("Missing catalog entries")?
+                    .iter()
+                    .cloned(),
+            );
+            match result.get("nextCursor") {
+                None | Some(Value::Null) => return Ok(items),
+                Some(Value::String(cursor)) if seen.insert(cursor.clone()) => {
+                    params["cursor"] = json!(cursor);
+                }
+                _ => return Err(anyhow!("Invalid or repeated backend pagination cursor")),
+            }
+        }
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
-        self.ensure_ready().await?;
-        let result: ListToolsResult = self.call("tools/list", None).await?;
-        Ok(result.tools)
+        self.catalog("tools/list", "tools")
+            .await?
+            .into_iter()
+            .map(|tool| serde_json::from_value(tool).map_err(Into::into))
+            .collect()
     }
 
-    /// Call a tool
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult> {
-        self.ensure_ready().await?;
-        let params = CallToolParams {
-            name: name.to_string(),
-            arguments,
-        };
-        self.call("tools/call", Some(serde_json::to_value(params)?))
-            .await
+        serde_json::from_value(
+            self.request("tools/call", json!({"name": name, "arguments": arguments}))
+                .await?,
+        )
+        .map_err(Into::into)
     }
 
-    /// List resources from this server
     pub async fn list_resources(&self) -> Result<Vec<Resource>> {
-        self.ensure_ready().await?;
-        let result: ListResourcesResult = self.call("resources/list", None).await?;
-        Ok(result.resources)
+        self.catalog("resources/list", "resources")
+            .await?
+            .into_iter()
+            .map(|resource| serde_json::from_value(resource).map_err(Into::into))
+            .collect()
     }
 
-    /// Read a resource
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
-        self.ensure_ready().await?;
-        let params = ReadResourceParams {
-            uri: uri.to_string(),
-        };
-        self.call("resources/read", Some(serde_json::to_value(params)?))
-            .await
+        serde_json::from_value(self.request("resources/read", json!({"uri": uri})).await?)
+            .map_err(Into::into)
     }
 
-    /// List prompts from this server
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
-        self.ensure_ready().await?;
-        let result: ListPromptsResult = self.call("prompts/list", None).await?;
-        Ok(result.prompts)
+        self.catalog("prompts/list", "prompts")
+            .await?
+            .into_iter()
+            .map(|prompt| serde_json::from_value(prompt).map_err(Into::into))
+            .collect()
     }
 
-    /// Get a prompt
     pub async fn get_prompt(
         &self,
         name: &str,
-        arguments: std::collections::HashMap<String, String>,
+        arguments: HashMap<String, String>,
     ) -> Result<GetPromptResult> {
-        self.ensure_ready().await?;
-        let params = GetPromptParams {
-            name: name.to_string(),
-            arguments,
-        };
-        self.call("prompts/get", Some(serde_json::to_value(params)?))
-            .await
+        serde_json::from_value(
+            self.request("prompts/get", json!({"name": name, "arguments": arguments}))
+                .await?,
+        )
+        .map_err(Into::into)
     }
 }
 
 impl Drop for ToolProxy {
     fn drop(&mut self) {
-        // Abort the reader task
         if let Ok(mut state) = self.state.try_lock() {
+            if let Some(handle) = state.writer_task.take() {
+                handle.abort();
+            }
             if let Some(handle) = state.reader_task.take() {
                 handle.abort();
             }
             if let Some(mut child) = state.process.take() {
                 let _ = child.start_kill();
             }
+            fail_pending(&state.pending, "Proxy dropped");
         }
     }
 }

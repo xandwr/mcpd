@@ -35,7 +35,8 @@ pub struct Response {
 }
 
 /// JSON-RPC error
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[error("RPC error {code}: {message}")]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
@@ -49,6 +50,7 @@ pub struct RpcError {
 pub enum RequestId {
     Number(i64),
     String(String),
+    Null,
 }
 
 impl Request {
@@ -180,6 +182,8 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Value,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +307,8 @@ pub enum Content {
 }
 
 /// Protocol version we support
-pub const PROTOCOL_VERSION: &str = "2025-11-25";
+pub const PROTOCOL_VERSION: &str = "2026-07-28";
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[cfg(test)]
 mod tests {
