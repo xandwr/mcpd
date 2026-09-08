@@ -2,9 +2,11 @@
 
 use crate::integration;
 use crate::registry::{BackendSpec, Registry, TransportSpec};
+#[cfg(not(unix))]
 use crate::server::Server;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+#[cfg(not(unix))]
 use tracing::info;
 
 #[derive(Parser)]
@@ -121,14 +123,17 @@ impl Cli {
             }
 
             Commands::Serve => {
-                let registry = Registry::load()?;
-                info!(
-                    backends = registry.len(),
-                    "Starting MCP server (find_tools, list_tools, use_tool)"
-                );
-
-                let server = Server::new(registry);
-                server.run().await
+                #[cfg(unix)]
+                return crate::bridge::run().await;
+                #[cfg(not(unix))]
+                {
+                    let registry = Registry::load()?;
+                    info!(
+                        backends = registry.len(),
+                        "Starting MCP server (find_tools, list_tools, use_tool)"
+                    );
+                    Server::new(registry).run().await
+                }
             }
             #[cfg(unix)]
             Commands::Daemon => {

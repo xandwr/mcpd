@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod bridge;
 pub mod cli;
 #[cfg(unix)]
 pub mod daemon;

@@ -5,6 +5,8 @@ use mcpd::proxy::ToolProxy;
 use mcpd::registry::{Registry, Tool};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::process::Stdio;
+use tokio::process::Command;
 
 fn decode(result: mcpd::mcp::CallToolResult) -> Value {
     assert!(!result.is_error);
@@ -38,13 +40,41 @@ async fn discovery_over_stdio_handles_filtering_errors_reload_and_invocation() {
             env: HashMap::new(),
         })
         .unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_mcpd"))
+        .arg("daemon")
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket = runtime.join("mcpd.sock");
+    for _ in 0..500 {
+        if socket.exists() {
+            break;
+        }
+        assert!(daemon.try_wait().unwrap().is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists());
     let proxy = ToolProxy::new(Tool {
         name: "mcpd".into(),
         command: vec![env!("CARGO_BIN_EXE_mcpd").into(), "serve".into()],
-        env: HashMap::from([(
-            "XDG_CONFIG_HOME".into(),
-            dir.path().to_string_lossy().into_owned(),
-        )]),
+        env: HashMap::from([
+            (
+                "XDG_CONFIG_HOME".into(),
+                dir.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                runtime.to_string_lossy().into_owned(),
+            ),
+        ]),
     });
     let tools = proxy.list_tools().await.unwrap();
     assert!(tools.iter().any(|tool| tool.name == "find_tools"));
@@ -106,4 +136,14 @@ async fn discovery_over_stdio_handles_filtering_errors_reload_and_invocation() {
     assert_eq!(refreshed["servers"], json!(["mock"]));
     assert_eq!(refreshed["errors"], json!([]));
     proxy.stop().await.unwrap();
+    Command::new("kill")
+        .arg("-INT")
+        .arg(daemon.id().unwrap().to_string())
+        .status()
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
 }

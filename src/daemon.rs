@@ -48,8 +48,12 @@ async fn remove_stale_socket(path: &Path) -> Result<()> {
                 .with_context(|| format!("Failed to inspect daemon socket {}", path.display()));
         }
     }
-    std::fs::remove_file(path)
-        .with_context(|| format!("Failed to remove stale socket {}", path.display()))?;
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error)
+            .with_context(|| format!("Failed to remove stale socket {}", path.display()));
+    }
     Ok(())
 }
 

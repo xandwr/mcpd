@@ -18,6 +18,7 @@ Source files in `src/`:
 
 - **main.rs** - Entry point. Initializes tracing (stderr, `RUST_LOG`), parses CLI, runs command.
 - **cli.rs** - clap-based CLI. Subcommands: `register`, `unregister`, `list`, `serve`, `daemon`, `setup pi`. Setup installs the bundled Pi extension. Resolves command paths via `which`.
+- **bridge.rs** - The `mcpd serve` stdio bridge. Discovers or starts the shared daemon, tolerates concurrent startup attempts, and forwards bytes in both directions.
 - **daemon.rs** - The Unix socket listener at `$XDG_RUNTIME_DIR/mcpd.sock`. Accepts concurrent client connections backed by one shared hub and shuts down cleanly on SIGINT or SIGTERM.
 - **discovery.rs** - Search parameters, ranked tool results, and keyword matching without extra dependencies.
 - **server.rs** - The transport-neutral client connection and shared aggregation hub. `Server` owns client initialization, subscriptions, cancellation, and output. `Hub` owns the registry, change broadcasts, and reusable backend sessions. Exposes three meta-tools (`find_tools`, `list_tools`, `use_tool`) and natively proxies resources and prompts.

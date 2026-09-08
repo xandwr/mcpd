@@ -23,7 +23,7 @@ Configure your MCP client to launch **`mcpd serve`** over stdio:
 }
 ```
 
-On Unix systems, `mcpd daemon` runs a shared instance at `$XDG_RUNTIME_DIR/mcpd.sock`. The socket accepts concurrent newline-delimited MCP connections, shares backend processes between them, and is created with user-only permissions. `mcpd serve` remains a standalone stdio process until the stdio bridge is introduced.
+On Unix systems, `mcpd serve` transparently connects stdio to a shared daemon at `$XDG_RUNTIME_DIR/mcpd.sock`, starting it when needed. Concurrent Codex, Claude, and Pi sessions share backend processes without changing their existing `mcpd serve` configuration. The socket is created with user-only permissions. `mcpd daemon` remains available for starting the shared process explicitly.
 
 Connect an agent client with the matching setup command:
 

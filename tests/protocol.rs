@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 struct Client {
     child: Child,
+    daemon: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     directory: tempfile::TempDir,
@@ -20,13 +21,36 @@ struct Client {
 }
 
 impl Client {
-    fn new() -> Self {
+    async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("mcpd")).unwrap();
+        let runtime = directory.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
         let registry = Registry::load_from(directory.path().join("mcpd/registry.json")).unwrap();
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_mcpd"))
+            .arg("daemon")
+            .env("XDG_CONFIG_HOME", directory.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let socket = runtime.join("mcpd.sock");
+        for _ in 0..500 {
+            if socket.exists() {
+                break;
+            }
+            assert!(daemon.try_wait().unwrap().is_none());
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists());
         let mut child = Command::new(env!("CARGO_BIN_EXE_mcpd"))
             .arg("serve")
             .env("XDG_CONFIG_HOME", directory.path())
+            .env("XDG_RUNTIME_DIR", runtime)
             .env("RUST_LOG", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -38,6 +62,7 @@ impl Client {
         let lines = BufReader::new(child.stdout.take().unwrap()).lines();
         Self {
             child,
+            daemon,
             stdin,
             lines,
             directory,
@@ -122,12 +147,22 @@ impl Client {
             .await
             .unwrap()
             .unwrap();
+        Command::new("kill")
+            .arg("-INT")
+            .arg(self.daemon.id().unwrap().to_string())
+            .status()
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.daemon.wait())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn stateless_discovery_version_errors_and_cache_fields() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     let first = client.call("tools/list", json!({})).await;
     assert_eq!(first["result"]["resultType"], "complete");
     assert_eq!(first["result"]["ttlMs"], 0);
@@ -171,7 +206,7 @@ async fn stateless_discovery_version_errors_and_cache_fields() {
 
 #[tokio::test]
 async fn modern_and_legacy_backends_preserve_catalogs_and_rich_results() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.register("modern", true);
     client.register("legacy", false);
     let found = client
@@ -243,7 +278,7 @@ async fn modern_and_legacy_backends_preserve_catalogs_and_rich_results() {
 
 #[tokio::test]
 async fn changed_backend_spec_replaces_the_live_proxy() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.register("swap", false);
     let first = client
         .call(
@@ -270,7 +305,7 @@ async fn changed_backend_spec_replaces_the_live_proxy() {
 
 #[tokio::test]
 async fn mrtr_retries_preserve_state_capabilities_and_backend_errors() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.register("modern", true);
     for (method, params) in [
         (
@@ -326,7 +361,7 @@ async fn mrtr_retries_preserve_state_capabilities_and_backend_errors() {
 
 #[tokio::test]
 async fn subscriptions_are_opt_in_filtered_and_cancellable() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.send(json!({"jsonrpc": "2.0", "id": "subscription", "method": "subscriptions/listen", "params": {
         "_meta": protocol::metadata(), "notifications": {"resourcesListChanged": true, "resourceSubscriptions": ["file:///not-supported"]}
     }})).await;
@@ -358,7 +393,7 @@ async fn subscriptions_are_opt_in_filtered_and_cancellable() {
 
 #[tokio::test]
 async fn cancellation_reaches_backend_and_does_not_block_other_requests() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.register("modern", true);
     client.send(json!({"jsonrpc": "2.0", "id": 100, "method": "tools/call", "params": {
         "_meta": protocol::metadata(), "name": "use_tool", "arguments": {"tool_name": "modern__slow"}
@@ -406,7 +441,7 @@ async fn cancellation_reaches_backend_and_does_not_block_other_requests() {
 
 #[tokio::test]
 async fn legacy_clients_can_still_initialize() {
-    let mut client = Client::new();
+    let mut client = Client::new().await;
     client.register("legacy", false);
     client.send(json!({"jsonrpc": "2.0", "id": 100, "method": "initialize", "params": {
         "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "old-client", "version": "1"}

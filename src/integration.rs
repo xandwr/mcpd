@@ -180,4 +180,12 @@ mod tests {
             .collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn bundled_pi_launches_mcpd_over_stdio() {
+        assert!(
+            include_str!("../integrations/pi.ts")
+                .contains("spawn(\"mcpd\", [\"serve\"], { stdio: \"pipe\" })")
+        );
+    }
 }
