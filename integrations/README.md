@@ -1,5 +1,11 @@
 # Agent integrations
 
+## Setup
+
+Configure a supported client with `mcpd setup <client>`. The built-in client integrations are `pi`, `codex`, and `claude`.
+
+Codex and Claude use their native MCP configuration commands and connect to `mcpd serve` over stdio. Their setup applies across projects. Pi uses the bundled bridge described below.
+
 ## Pi
 
 Install mcpd and its bundled extension:

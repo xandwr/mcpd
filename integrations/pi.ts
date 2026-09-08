@@ -8,6 +8,7 @@ export default function (pi: ExtensionAPI) {
   let sequence = 0;
   let stderr = "";
   const protocolVersion = "2026-07-28";
+  const clientVersion = "__MCPD_VERSION__";
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
 
   function stop(error = new Error("mcpd connection closed")) {
@@ -55,7 +56,7 @@ export default function (pi: ExtensionAPI) {
           _meta: {
             "io.modelcontextprotocol/protocolVersion": protocolVersion,
             "io.modelcontextprotocol/clientCapabilities": {},
-            "io.modelcontextprotocol/clientInfo": { name: "pi-mcpd", version: "1.0.0" },
+            "io.modelcontextprotocol/clientInfo": { name: "pi-mcpd", version: clientVersion },
           },
         } });
       } catch (error) {

@@ -242,6 +242,33 @@ async fn modern_and_legacy_backends_preserve_catalogs_and_rich_results() {
 }
 
 #[tokio::test]
+async fn changed_backend_spec_replaces_the_live_proxy() {
+    let mut client = Client::new();
+    client.register("swap", false);
+    let first = client
+        .call(
+            "tools/call",
+            json!({"name": "find_tools", "arguments": {"query": "echo", "server": "swap"}}),
+        )
+        .await;
+    let first: Value =
+        serde_json::from_str(first["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(first["tools"][0]["name"], "swap__echo");
+
+    client.register("swap", true);
+    let replaced = client
+        .call(
+            "tools/call",
+            json!({"name": "find_tools", "arguments": {"query": "needs_input", "server": "swap"}}),
+        )
+        .await;
+    let replaced: Value =
+        serde_json::from_str(replaced["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(replaced["tools"][0]["name"], "swap__needs_input");
+    client.stop().await;
+}
+
+#[tokio::test]
 async fn mrtr_retries_preserve_state_capabilities_and_backend_errors() {
     let mut client = Client::new();
     client.register("modern", true);

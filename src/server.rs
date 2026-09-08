@@ -4,7 +4,7 @@ use crate::mcp::{
     Tool as McpTool,
 };
 use crate::protocol::{self, CAPABILITIES, SUBSCRIPTION_ID};
-use crate::proxy::ToolProxy;
+use crate::proxy::BackendSession;
 use crate::registry::Registry;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 pub struct Server {
     registry: RwLock<Registry>,
-    proxies: RwLock<HashMap<String, Arc<ToolProxy>>>,
+    proxies: RwLock<HashMap<String, Arc<BackendSession>>>,
     initialized: RwLock<bool>,
     subscriptions: Mutex<HashMap<RequestId, Value>>,
     stdout: Mutex<tokio::io::Stdout>,
@@ -55,9 +55,18 @@ impl Server {
         let names = registry.names();
         let mut proxies = self.proxies.write().await;
         let mut changed = false;
-        for tool in registry.list() {
-            if !proxies.contains_key(&tool.name) {
-                proxies.insert(tool.name.clone(), Arc::new(ToolProxy::new(tool.clone())));
+        for backend in registry.list() {
+            let replaced = proxies
+                .get(&backend.name)
+                .is_some_and(|proxy| !proxy.matches(backend));
+            if replaced && let Some(proxy) = proxies.remove(&backend.name) {
+                let _ = proxy.stop().await;
+            }
+            if replaced || !proxies.contains_key(&backend.name) {
+                proxies.insert(
+                    backend.name.clone(),
+                    Arc::new(BackendSession::new(backend.clone())),
+                );
                 changed = true;
             }
         }

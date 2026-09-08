@@ -23,7 +23,15 @@ Configure your MCP client to launch **`mcpd serve`** over stdio:
 }
 ```
 
-For **Pi**, run `mcpd setup pi`, then `/reload`. Repeat after upgrading. The bundled extension runs mcpd from PATH and prefixes its tools with `mcpd_`.
+Connect an agent client with the matching setup command:
+
+```sh
+mcpd setup pi
+mcpd setup codex
+mcpd setup claude
+```
+
+Pi installs a bundled extension and requires `/reload`. Codex and Claude are configured through their native MCP commands. Repeat setup after upgrading mcpd.
 
 ## Discover and use
 

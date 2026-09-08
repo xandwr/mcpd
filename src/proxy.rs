@@ -4,7 +4,7 @@ use crate::mcp::{
     Response, RpcError, Tool as McpTool,
 };
 use crate::protocol::{self, CAPABILITIES, CLIENT_INFO, VERSION};
-use crate::registry::Tool;
+use crate::registry::{BackendSpec, TransportSpec};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 type Pending = Arc<std::sync::Mutex<HashMap<i64, oneshot::Sender<Response>>>>;
 type Input = mpsc::UnboundedSender<Vec<u8>>;
 
-pub struct ToolProxy {
-    tool: Tool,
+pub struct BackendSession {
+    backend: BackendSpec,
     state: Mutex<ProxyState>,
     init_lock: Mutex<()>,
     next_id: AtomicI64,
@@ -65,10 +65,10 @@ fn fail_pending(pending: &Pending, message: &str) {
     }
 }
 
-impl ToolProxy {
-    pub fn new(tool: Tool) -> Self {
+impl BackendSession {
+    pub fn new(backend: impl Into<BackendSpec>) -> Self {
         Self {
-            tool,
+            backend: backend.into(),
             state: Mutex::new(ProxyState {
                 process: None,
                 stdin: None,
@@ -97,20 +97,17 @@ impl ToolProxy {
             handle.abort();
         }
         fail_pending(&state.pending, "Proxy restarted");
-        let command = self
-            .tool
-            .command
-            .first()
-            .context("Backend command is empty")?;
-        let mut child = Command::new(command)
-            .args(&self.tool.command[1..])
+        let TransportSpec::Stdio { command, env } = &self.backend.transport;
+        let executable = command.first().context("Backend command is empty")?;
+        let mut child = Command::new(executable)
+            .args(&command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .envs(&self.tool.env)
+            .envs(env)
             .spawn()
-            .with_context(|| format!("Failed to spawn backend: {}", self.tool.name))?;
+            .with_context(|| format!("Failed to spawn backend: {}", self.backend.name))?;
         let mut input = child.stdin.take().context("Missing stdin")?;
         let (stdin, mut outgoing) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending = Arc::clone(&state.pending);
@@ -129,7 +126,7 @@ impl ToolProxy {
         self.modern.store(false, Ordering::SeqCst);
         let modern = Arc::clone(&self.modern);
         let pending = Arc::clone(&state.pending);
-        let name = self.tool.name.clone();
+        let name = self.backend.name.clone();
         state.reader_task = Some(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -261,7 +258,7 @@ impl ToolProxy {
         self.start().await?;
         if self.state.lock().await.protocol.is_none() {
             let version = self.negotiate().await?;
-            debug!(backend = %self.tool.name, protocol = %version, "Backend ready");
+            debug!(backend = %self.backend.name, protocol = %version, "Backend ready");
             self.modern
                 .store(version == PROTOCOL_VERSION, Ordering::SeqCst);
             self.state.lock().await.protocol = Some(version);
@@ -327,6 +324,10 @@ impl ToolProxy {
             meta.remove(CLIENT_INFO);
         }
         self.call(method, Some(params)).await
+    }
+
+    pub fn matches(&self, backend: &BackendSpec) -> bool {
+        &self.backend == backend
     }
 
     pub async fn catalog(&self, method: &str, field: &str) -> Result<Vec<Value>> {
@@ -402,7 +403,7 @@ impl ToolProxy {
     }
 }
 
-impl Drop for ToolProxy {
+impl Drop for BackendSession {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.try_lock() {
             if let Some(handle) = state.writer_task.take() {
@@ -418,3 +419,5 @@ impl Drop for ToolProxy {
         }
     }
 }
+
+pub type ToolProxy = BackendSession;
