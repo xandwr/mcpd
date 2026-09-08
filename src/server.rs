@@ -15,11 +15,16 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 pub struct Server {
-    registry: RwLock<Registry>,
-    proxies: RwLock<HashMap<String, Arc<BackendSession>>>,
+    hub: Arc<Hub>,
+    shutdown_hub_on_close: bool,
     initialized: RwLock<bool>,
     subscriptions: Mutex<HashMap<RequestId, Value>>,
     stdout: Mutex<tokio::io::Stdout>,
+}
+
+pub struct Hub {
+    registry: RwLock<Registry>,
+    proxies: RwLock<HashMap<String, Arc<BackendSession>>>,
 }
 
 fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> Response {
@@ -32,8 +37,18 @@ fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> R
 impl Server {
     pub fn new(registry: Registry) -> Self {
         Self {
-            registry: RwLock::new(registry),
-            proxies: RwLock::new(HashMap::new()),
+            hub: Arc::new(Hub::new(registry)),
+            shutdown_hub_on_close: true,
+            initialized: RwLock::new(false),
+            subscriptions: Mutex::new(HashMap::new()),
+            stdout: Mutex::new(tokio::io::stdout()),
+        }
+    }
+
+    pub fn from_hub(hub: Arc<Hub>) -> Self {
+        Self {
+            hub,
+            shutdown_hub_on_close: false,
             initialized: RwLock::new(false),
             subscriptions: Mutex::new(HashMap::new()),
             stdout: Mutex::new(tokio::io::stdout()),
@@ -50,56 +65,24 @@ impl Server {
     }
 
     async fn sync_registry(&self) -> Result<()> {
-        let mut registry = self.registry.write().await;
-        registry.reload()?;
-        let names = registry.names();
-        let mut proxies = self.proxies.write().await;
-        let mut changed = false;
-        for backend in registry.list() {
-            let replaced = proxies
-                .get(&backend.name)
-                .is_some_and(|proxy| !proxy.matches(backend));
-            if replaced && let Some(proxy) = proxies.remove(&backend.name) {
-                let _ = proxy.stop().await;
-            }
-            if replaced || !proxies.contains_key(&backend.name) {
-                proxies.insert(
-                    backend.name.clone(),
-                    Arc::new(BackendSession::new(backend.clone())),
-                );
-                changed = true;
-            }
+        if !self.hub.sync_registry().await? {
+            return Ok(());
         }
-        let stale: Vec<_> = proxies
-            .keys()
-            .filter(|name| !names.contains(*name))
-            .cloned()
-            .collect();
-        for name in stale {
-            if let Some(proxy) = proxies.remove(&name) {
-                let _ = proxy.stop().await;
+        for (method, filter) in [
+            ("notifications/tools/list_changed", "toolsListChanged"),
+            (
+                "notifications/resources/list_changed",
+                "resourcesListChanged",
+            ),
+            ("notifications/prompts/list_changed", "promptsListChanged"),
+        ] {
+            if *self.initialized.read().await {
+                self.write(&Notification::new(method)).await?;
             }
-            changed = true;
-        }
-        drop(proxies);
-        drop(registry);
-        if changed {
-            for (method, filter) in [
-                ("notifications/tools/list_changed", "toolsListChanged"),
-                (
-                    "notifications/resources/list_changed",
-                    "resourcesListChanged",
-                ),
-                ("notifications/prompts/list_changed", "promptsListChanged"),
-            ] {
-                if *self.initialized.read().await {
-                    self.write(&Notification::new(method)).await?;
-                }
-                let subscriptions = self.subscriptions.lock().await;
-                for (id, filters) in subscriptions.iter() {
-                    if filters[filter] == true {
-                        self.write(&json!({"jsonrpc": "2.0", "method": method, "params": {"_meta": {SUBSCRIPTION_ID: id}}})).await?;
-                    }
+            let subscriptions = self.subscriptions.lock().await;
+            for (id, filters) in subscriptions.iter() {
+                if filters[filter] == true {
+                    self.write(&json!({"jsonrpc": "2.0", "method": method, "params": {"_meta": {SUBSCRIPTION_ID: id}}})).await?;
                 }
             }
         }
@@ -155,6 +138,52 @@ impl Server {
         subscriptions.insert(request.id.clone(), accepted);
         Ok(())
     }
+}
+
+impl Hub {
+    pub fn new(registry: Registry) -> Self {
+        Self {
+            registry: RwLock::new(registry),
+            proxies: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn sync_registry(&self) -> Result<bool> {
+        let mut registry = self.registry.write().await;
+        registry.reload()?;
+        let names = registry.names();
+        let mut proxies = self.proxies.write().await;
+        let mut changed = false;
+        for backend in registry.list() {
+            let replaced = proxies
+                .get(&backend.name)
+                .is_some_and(|proxy| !proxy.matches(backend));
+            if replaced && let Some(proxy) = proxies.remove(&backend.name) {
+                let _ = proxy.stop().await;
+            }
+            if replaced || !proxies.contains_key(&backend.name) {
+                proxies.insert(
+                    backend.name.clone(),
+                    Arc::new(BackendSession::new(backend.clone())),
+                );
+                changed = true;
+            }
+        }
+        let stale: Vec<_> = proxies
+            .keys()
+            .filter(|name| !names.contains(*name))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(proxy) = proxies.remove(&name) {
+                let _ = proxy.stop().await;
+            }
+            changed = true;
+        }
+        drop(proxies);
+        drop(registry);
+        Ok(changed)
+    }
 
     fn namespace_uri(server: &str, uri: &str) -> String {
         format!(
@@ -176,7 +205,6 @@ impl Server {
     }
 
     async fn aggregate_catalog(&self, method: &str, field: &str) -> Result<Vec<Value>> {
-        self.sync_registry().await?;
         let proxies: Vec<_> = self
             .proxies
             .read()
@@ -240,7 +268,6 @@ impl Server {
                 .split_once("__")
                 .ok_or_else(|| protocol::invalid("Expected server__name"))?
         };
-        self.sync_registry().await?;
         let proxy = self
             .proxies
             .read()
@@ -358,7 +385,9 @@ impl Server {
         }
         Ok(result)
     }
+}
 
+impl Server {
     async fn dispatch(&self, request: &Request, modern: bool) -> Result<Value> {
         let params = request.params.clone().unwrap_or(json!({}));
         match request.method.as_str() {
@@ -394,10 +423,11 @@ impl Server {
                             .map_err(|error| protocol::invalid(error.to_string()))?;
                         search.validate().map_err(protocol::invalid)?;
                         let found = self.find_tools(&search).await.map_err(anyhow::Error::msg)?;
-                        Ok(Self::tool_result(serde_json::to_value(found)?))
+                        Ok(Hub::tool_result(serde_json::to_value(found)?))
                     }
                     "list_tools" => {
-                        let mut tools = self.aggregate_catalog("tools/list", "tools").await?;
+                        self.sync_registry().await?;
+                        let mut tools = self.hub.aggregate_catalog("tools/list", "tools").await?;
                         for tool in &mut tools {
                             if let Some(schema) = tool
                                 .as_object_mut()
@@ -406,7 +436,7 @@ impl Server {
                                 tool["input_schema"] = schema;
                             }
                         }
-                        Ok(Self::tool_result(json!(tools)))
+                        Ok(Hub::tool_result(json!(tools)))
                     }
                     "use_tool" => {
                         let tool = arguments["tool_name"]
@@ -416,7 +446,8 @@ impl Server {
                         backend_params["name"] = json!(tool);
                         backend_params["arguments"] =
                             arguments.get("arguments").cloned().unwrap_or(json!({}));
-                        self.route("tools/call", backend_params, modern).await
+                        self.sync_registry().await?;
+                        self.hub.route("tools/call", backend_params, modern).await
                     }
                     _ => Err(protocol::invalid(format!(
                         "Unknown tool '{}'. Use find_tools, list_tools, or use_tool.",
@@ -431,9 +462,13 @@ impl Server {
                     "resources/templates/list" => "resourceTemplates",
                     _ => "prompts",
                 };
-                Ok(json!({field: self.aggregate_catalog(&request.method, field).await?}))
+                self.sync_registry().await?;
+                Ok(json!({field: self.hub.aggregate_catalog(&request.method, field).await?}))
             }
-            "resources/read" | "prompts/get" => self.route(&request.method, params, modern).await,
+            "resources/read" | "prompts/get" => {
+                self.sync_registry().await?;
+                self.hub.route(&request.method, params, modern).await
+            }
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("Unknown method: {}", request.method),
@@ -539,8 +574,8 @@ impl Server {
             protocol::finish(&mut response, "subscriptions/listen", true);
             server.write(&response).await?;
         }
-        for proxy in server.proxies.read().await.values() {
-            let _ = proxy.stop().await;
+        if server.shutdown_hub_on_close {
+            server.hub.shutdown().await;
         }
         Ok(())
     }
@@ -617,8 +652,22 @@ impl Server {
     }
 
     pub async fn find_tools(&self, params: &FindToolsParams) -> Result<FindToolsResult, String> {
+        self.sync_registry()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.hub.find_tools(params).await
+    }
+}
+
+impl Hub {
+    pub async fn shutdown(&self) {
+        for proxy in self.proxies.read().await.values() {
+            let _ = proxy.stop().await;
+        }
+    }
+
+    async fn find_tools(&self, params: &FindToolsParams) -> Result<FindToolsResult, String> {
         params.validate()?;
-        self.sync_registry().await.map_err(|e| e.to_string())?;
         let proxies = self.proxies.read().await;
         let servers: Vec<_> = proxies.keys().cloned().collect();
         if let Some(server) = &params.server
@@ -670,22 +719,47 @@ impl Server {
 mod tests {
     use super::*;
     use crate::mcp::RequestId;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn shared_servers_keep_connection_state_isolated() {
+        let directory = TempDir::new().unwrap();
+        let registry = Registry::load_from(directory.path().join("registry.json")).unwrap();
+        let hub = Arc::new(Hub::new(registry));
+        let first = Server::from_hub(Arc::clone(&hub));
+        let second = Server::from_hub(Arc::clone(&hub));
+
+        *first.initialized.write().await = true;
+        first
+            .subscriptions
+            .lock()
+            .await
+            .insert(RequestId::Number(1), json!({"toolsListChanged": true}));
+
+        assert!(Arc::ptr_eq(&first.hub, &second.hub));
+        assert!(*first.initialized.read().await);
+        assert!(!*second.initialized.read().await);
+        assert_eq!(first.subscriptions.lock().await.len(), 1);
+        assert!(second.subscriptions.lock().await.is_empty());
+        assert!(!first.shutdown_hub_on_close);
+        assert!(!second.shutdown_hub_on_close);
+    }
 
     #[test]
     fn namespace_uri_normal() {
-        let result = Server::namespace_uri("myserver", "file:///test.txt");
+        let result = Hub::namespace_uri("myserver", "file:///test.txt");
         assert_eq!(result, "mcpd://myserver/file:///test.txt");
     }
 
     #[test]
     fn namespace_uri_already_prefixed() {
-        let result = Server::namespace_uri("myserver", "mcpd://other/resource");
+        let result = Hub::namespace_uri("myserver", "mcpd://other/resource");
         assert_eq!(result, "mcpd://myserver/other/resource");
     }
 
     #[test]
     fn namespace_uri_empty() {
-        let result = Server::namespace_uri("srv", "");
+        let result = Hub::namespace_uri("srv", "");
         assert_eq!(result, "mcpd://srv/");
     }
 

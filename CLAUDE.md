@@ -11,7 +11,7 @@ mcpd is a daemon that aggregates multiple MCP (Model Context Protocol) servers i
 ## Architecture
 
 ```
-Client (stdio) -> Server -> [Registry] -> ToolProxy (per backend) -> subprocess (stdio)
+Client (stdio) -> Server -> Hub -> [Registry] -> BackendSession (per backend) -> subprocess (stdio)
 ```
 
 Source files in `src/`:
@@ -19,7 +19,7 @@ Source files in `src/`:
 - **main.rs** - Entry point. Initializes tracing (stderr, `RUST_LOG`), parses CLI, runs command.
 - **cli.rs** - clap-based CLI. Subcommands: `register`, `unregister`, `list`, `serve`, `setup pi`. Setup installs the bundled Pi extension. Resolves command paths via `which`.
 - **discovery.rs** - Search parameters, ranked tool results, and keyword matching without extra dependencies.
-- **server.rs** - The aggregating MCP server. Listens on stdin/stdout. Exposes three meta-tools (`find_tools`, `list_tools`, `use_tool`) and natively proxies resources and prompts. Syncs registry from disk on every request and sends `list_changed` notifications on changes.
+- **server.rs** - The stdio client connection and shared aggregation hub. `Server` owns client initialization, subscriptions, cancellation, and output. `Hub` owns the registry and reusable backend sessions. Exposes three meta-tools (`find_tools`, `list_tools`, `use_tool`) and natively proxies resources and prompts.
 - **proxy.rs** - `ToolProxy` manages one backend subprocess. Handles spawn, modern discovery with legacy handshake fallback, queued writes, JSON-RPC response matching, pagination, cancellation, and shutdown. On-demand - only starts when needed.
 - **registry.rs** - Persistent JSON storage at `~/.config/mcpd/registry.json`. Stores tool name, command (resolved path + args), and per-server environment variables. Supports reload from disk.
 - **protocol.rs** - Modern request validation, version errors, server identity, and result/cache metadata.
