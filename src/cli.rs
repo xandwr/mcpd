@@ -42,6 +42,10 @@ enum Commands {
     /// Run the aggregating MCP server (stdio mode)
     Serve,
 
+    #[cfg(unix)]
+    #[command(about = "Run the shared MCP daemon over a Unix socket")]
+    Daemon,
+
     #[command(about = "Install or update a bundled agent integration")]
     Setup { client: String },
 }
@@ -125,6 +129,11 @@ impl Cli {
 
                 let server = Server::new(registry);
                 server.run().await
+            }
+            #[cfg(unix)]
+            Commands::Daemon => {
+                let registry = Registry::load()?;
+                crate::daemon::run(registry).await
             }
         }
     }

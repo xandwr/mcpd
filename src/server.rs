@@ -10,21 +10,24 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::{info, warn};
+
+type Output = Box<dyn AsyncWrite + Unpin + Send>;
 
 pub struct Server {
     hub: Arc<Hub>,
     shutdown_hub_on_close: bool,
     initialized: RwLock<bool>,
     subscriptions: Mutex<HashMap<RequestId, Value>>,
-    stdout: Mutex<tokio::io::Stdout>,
+    output: Mutex<Output>,
 }
 
 pub struct Hub {
     registry: RwLock<Registry>,
     proxies: RwLock<HashMap<String, Arc<BackendSession>>>,
+    changes: broadcast::Sender<()>,
 }
 
 fn success_or_internal_error(id: RequestId, result: &impl serde::Serialize) -> Response {
@@ -41,33 +44,42 @@ impl Server {
             shutdown_hub_on_close: true,
             initialized: RwLock::new(false),
             subscriptions: Mutex::new(HashMap::new()),
-            stdout: Mutex::new(tokio::io::stdout()),
+            output: Mutex::new(Box::new(tokio::io::stdout())),
         }
     }
 
     pub fn from_hub(hub: Arc<Hub>) -> Self {
+        Self::from_hub_with_output(hub, tokio::io::stdout())
+    }
+
+    pub fn from_hub_with_output<W>(hub: Arc<Hub>, output: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         Self {
             hub,
             shutdown_hub_on_close: false,
             initialized: RwLock::new(false),
             subscriptions: Mutex::new(HashMap::new()),
-            stdout: Mutex::new(tokio::io::stdout()),
+            output: Mutex::new(Box::new(output)),
         }
     }
 
     async fn write(&self, message: &impl serde::Serialize) -> Result<()> {
         let mut line = serde_json::to_vec(message)?;
         line.push(b'\n');
-        let mut stdout = self.stdout.lock().await;
-        stdout.write_all(&line).await?;
-        stdout.flush().await?;
+        let mut output = self.output.lock().await;
+        output.write_all(&line).await?;
+        output.flush().await?;
         Ok(())
     }
 
     async fn sync_registry(&self) -> Result<()> {
-        if !self.hub.sync_registry().await? {
-            return Ok(());
-        }
+        self.hub.sync_registry().await?;
+        Ok(())
+    }
+
+    async fn notify_registry_changed(&self) -> Result<()> {
         for (method, filter) in [
             ("notifications/tools/list_changed", "toolsListChanged"),
             (
@@ -142,13 +154,19 @@ impl Server {
 
 impl Hub {
     pub fn new(registry: Registry) -> Self {
+        let (changes, _) = broadcast::channel(16);
         Self {
             registry: RwLock::new(registry),
             proxies: RwLock::new(HashMap::new()),
+            changes,
         }
     }
 
-    async fn sync_registry(&self) -> Result<bool> {
+    fn subscribe_changes(&self) -> broadcast::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    async fn sync_registry(&self) -> Result<()> {
         let mut registry = self.registry.write().await;
         registry.reload()?;
         let names = registry.names();
@@ -182,7 +200,10 @@ impl Hub {
         }
         drop(proxies);
         drop(registry);
-        Ok(changed)
+        if changed {
+            let _ = self.changes.send(());
+        }
+        Ok(())
     }
 
     fn namespace_uri(server: &str, uri: &str) -> String {
@@ -503,12 +524,28 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<()> {
+        self.run_with(tokio::io::stdin()).await
+    }
+
+    pub async fn run_with<R>(self, input: R) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
         let server = Arc::new(self);
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut lines = BufReader::new(input).lines();
+        let mut changes = server.hub.subscribe_changes();
         let mut tasks = tokio::task::JoinSet::new();
         let mut active: HashMap<RequestId, tokio::task::AbortHandle> = HashMap::new();
         loop {
             tokio::select! {
+                changed = changes.recv() => {
+                    match changed {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            server.notify_registry_changed().await?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Ok((id, response))) = completed
                         && active.remove(&id).is_some()

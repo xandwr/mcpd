@@ -1,4 +1,6 @@
 pub mod cli;
+#[cfg(unix)]
+pub mod daemon;
 pub mod discovery;
 pub mod integration;
 pub mod mcp;
